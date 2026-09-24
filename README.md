@@ -1,6 +1,8 @@
 <!-- <h1><img src="assets/logo.png" width="120" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;">&nbsp;DeepSeek Cursor Proxy (1M)</h1> -->
 <h1 align="center"><img src="assets/logo.png" width="150" alt="deepseek-cursor-proxy logo"><br>DeepSeek Cursor Proxy &mdash; 1M context fork</h1>
 
+<p align="center"><b>English</b> | <a href="README.ru.md">Русский</a> | <a href="README.zh-CN.md">简体中文</a></p>
+
 A compatibility proxy that connects **Cursor** (and other OpenAI-compatible
 coding agents) to **DeepSeek thinking models**. It fixes the
 `reasoning_content` tool-call error and lets you run DeepSeek inside Cursor with
