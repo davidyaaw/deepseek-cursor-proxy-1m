@@ -1,0 +1,79 @@
+# DeepSeek Cursor Proxy - example configuration
+#
+# The proxy generates this file automatically on first run at
+#   ~/.deepseek-cursor-proxy/config.yaml
+# on Windows / macOS / Linux. Copy it there (or point the proxy at it with
+# `--config <path>`) and edit to taste. Every option can also be overridden with
+# a command-line flag.
+#
+# API keys are NOT stored here: they are read from the client's Authorization
+# header (e.g. the DeepSeek API key you enter in Cursor) and forwarded upstream.
+
+# --- Upstream (DeepSeek) -------------------------------------------------
+
+# DeepSeek API base URL. The proxy appends /chat/completions.
+base_url: https://api.deepseek.com
+
+# Fallback model, and the rewrite target for any non-DeepSeek model id. Cursor's
+# requested DeepSeek model name is forwarded as-is; a name that does NOT start
+# with "deepseek-" (for example the Cursor built-in "GPT-5.6 Sol", which Cursor
+# gives a 1M context window) is rewritten to this model. Point Cursor at a 1M
+# catalog model and you get a 1M window backed by DeepSeek.
+model: deepseek-flash
+
+# DeepSeek thinking mode: enabled | disabled
+thinking: enabled
+
+# Reasoning effort: low | medium | high | max | xhigh
+reasoning_effort: max
+
+# --- Cursor display ------------------------------------------------------
+
+# Mirror reasoning_content into Cursor-visible content.
+display_reasoning: true
+
+# Render the mirrored reasoning inside a collapsible Markdown <details> block.
+# (The historical upstream typo "collasible_reasoning" is also accepted.)
+collasible_reasoning: true
+
+# --- Local server --------------------------------------------------------
+
+# Bind address and port for the local proxy.
+host: 127.0.0.1
+port: 9000
+
+# Start an ngrok tunnel so Cursor (which blocks localhost URLs) can reach the
+# proxy. Set to false to run localhost-only.
+ngrok: true
+
+# Fixed / reserved ngrok endpoint or custom domain, passed to `ngrok http --url`.
+# Leave unset to let ngrok assign a random URL each run.
+# ngrok_url: https://your-subdomain.ngrok.dev
+
+# Log full request metadata and payloads to the terminal.
+verbose: false
+
+# Upstream request timeout in seconds.
+request_timeout: 300
+
+# Maximum accepted request body size in bytes (20 MiB).
+max_request_body_bytes: 20971520
+
+# Send permissive CORS headers.
+cors: false
+
+# --- Reasoning cache -----------------------------------------------------
+
+# SQLite cache path (relative paths are resolved next to this config file).
+reasoning_content_path: reasoning_content.sqlite3
+
+# What to do when required reasoning_content is missing:
+#   recover - rebuild it from the cache / partial history (friendly default)
+#   reject  - fail the request with 409 (strict debugging)
+missing_reasoning_strategy: recover
+
+# Drop cache rows older than this (seconds). Default: 30 days.
+reasoning_cache_max_age_seconds: 2592000
+
+# Maximum number of cache rows to keep.
+reasoning_cache_max_rows: 100000
