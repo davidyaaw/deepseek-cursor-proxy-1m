@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
+
+from .logging import LOG, request_id
 
 
 def normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -177,15 +180,26 @@ def portable_reasoning_keys(
     return keys
 
 
+class ReasoningStoreBusy(Exception):
+    """Raised when the cache lock is still held after the wait limit."""
+
+
 class ReasoningStore:
+    """SQLite cache of DeepSeek reasoning_content, safe to share across requests."""
+
     def __init__(
         self,
         reasoning_content_path: str | Path,
         max_age_seconds: int | None = None,
         max_rows: int | None = None,
+        *,
+        busy_timeout_seconds: float = 5.0,
+        lock_timeout_seconds: float = 5.0,
     ) -> None:
         self.max_age_seconds = max_age_seconds
         self.max_rows = max_rows
+        self._busy_timeout_seconds = busy_timeout_seconds
+        self._lock_timeout_seconds = lock_timeout_seconds
         if str(reasoning_content_path) == ":memory:":
             self.reasoning_content_path: str | Path = ":memory:"
         else:
@@ -194,12 +208,32 @@ class ReasoningStore:
                 mode=0o700, parents=True, exist_ok=True
             )
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            self.reasoning_content_path, check_same_thread=False
+        self._conn = self._connect()
+        self.prune()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open the cache in autocommit mode so a failed write cannot stick."""
+        conn = sqlite3.connect(
+            self.reasoning_content_path,
+            timeout=self._busy_timeout_seconds,
+            isolation_level=None,
+            check_same_thread=False,
         )
+        self._configure(conn)
         if isinstance(self.reasoning_content_path, Path):
             self.reasoning_content_path.chmod(0o600)
-        self._conn.execute(
+        return conn
+
+    def _configure(self, conn: sqlite3.Connection) -> None:
+        """Enable WAL, a bounded lock wait, and the cache schema."""
+        busy_ms = max(int(self._busy_timeout_seconds * 1000), 0)
+        conn.execute(f"PRAGMA busy_timeout = {busy_ms}")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error as exc:
+            LOG.warning("reasoning cache WAL mode unavailable: %s", exc)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reasoning_cache (
                 key TEXT PRIMARY KEY,
@@ -209,38 +243,113 @@ class ReasoningStore:
             )
             """
         )
-        self._conn.commit()
-        self.prune()
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS reasoning_cache_created_at_idx
+            ON reasoning_cache(created_at)
+            """
+        )
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Take the cache lock, but give up so one writer cannot stall every request."""
+        acquired = self._lock.acquire(timeout=self._lock_timeout_seconds)
+        if not acquired:
+            raise ReasoningStoreBusy("reasoning cache lock timed out")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _recover_locked(self) -> None:
+        """Drop a failed transaction, reopening the file if the connection is dead."""
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.execute("SELECT 1")
+        except sqlite3.Error:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = self._connect()
+
+    def _fail_locked(self, operation: str, exc: sqlite3.Error) -> None:
+        """Log a cache failure and leave the connection usable for the next request."""
+        LOG.warning(
+            "reasoning_cache_%s id=%s error=%s",
+            operation,
+            request_id(),
+            exc,
+        )
+        self._recover_locked()
 
     def close(self) -> None:
         with self._lock:
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             self._conn.close()
 
     def put(self, key: str, reasoning: str, message: dict[str, Any]) -> None:
         if not isinstance(reasoning, str):
             return
         message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO reasoning_cache(key, reasoning, message_json, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    reasoning = excluded.reasoning,
-                    message_json = excluded.message_json,
-                    created_at = excluded.created_at
-                """,
-                (key, reasoning, message_json, time.time()),
-            )
-            self._prune_locked()
-            self._conn.commit()
+        self._put_many([(key, reasoning, message_json, time.time())])
+
+    def _put_many(self, rows: list[tuple[str, str, str, float]]) -> int:
+        """Write many cache keys in one transaction and prune once."""
+        if not rows:
+            return 0
+        try:
+            with self._locked():
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    self._conn.executemany(
+                        """
+                        INSERT INTO reasoning_cache(
+                            key, reasoning, message_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            reasoning = excluded.reasoning,
+                            message_json = excluded.message_json,
+                            created_at = excluded.created_at
+                        """,
+                        rows,
+                    )
+                    self._prune_locked()
+                    self._conn.execute("COMMIT")
+                except sqlite3.Error as exc:
+                    self._fail_locked("write", exc)
+                    return 0
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_cache_write id=%s lock_timeout", request_id())
+            return 0
+        return len(rows)
 
     def get(self, key: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT reasoning FROM reasoning_cache WHERE key = ?",
-                (key,),
-            ).fetchone()
+        row = None
+        try:
+            with self._locked():
+                try:
+                    cursor = self._conn.execute(
+                        "SELECT reasoning FROM reasoning_cache WHERE key = ?",
+                        (key,),
+                    )
+                    try:
+                        row = cursor.fetchone()
+                    finally:
+                        cursor.close()
+                except sqlite3.Error as exc:
+                    self._fail_locked("read", exc)
+                    return None
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_cache_read id=%s lock_timeout", request_id())
+            return None
         if row is None:
             return None
         return str(row[0])
@@ -264,9 +373,11 @@ class ReasoningStore:
                 portable_reasoning_keys(message, cache_namespace, prior_messages)
             )
         keys = list(dict.fromkeys(keys))
-        for key in keys:
-            self.put(key, reasoning, message)
-        return len(keys)
+        message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
+        created_at = time.time()
+        return self._put_many(
+            [(key, reasoning, message_json, created_at) for key in keys]
+        )
 
     def lookup_for_message(
         self,
@@ -295,30 +406,68 @@ class ReasoningStore:
     ) -> int:
         if not isinstance(reasoning, str):
             return 0
-        keys = portable_reasoning_keys(message, cache_namespace, prior_messages)
+        keys = list(
+            dict.fromkeys(
+                portable_reasoning_keys(message, cache_namespace, prior_messages)
+            )
+        )
         if not keys:
+            return 0
+        # Scoped keys are consulted first, so a warm cache would otherwise
+        # rewrite the same portable aliases on every later agent turn.
+        if self.get(keys[0]) is not None:
             return 0
         message_with_reasoning = dict(message)
         message_with_reasoning["reasoning_content"] = reasoning
-        for key in dict.fromkeys(keys):
-            self.put(key, reasoning, message_with_reasoning)
-        return len(keys)
+        message_json = json.dumps(
+            message_with_reasoning, ensure_ascii=False, sort_keys=True
+        )
+        created_at = time.time()
+        return self._put_many(
+            [(key, reasoning, message_json, created_at) for key in keys]
+        )
 
     def clear(self) -> int:
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM reasoning_cache").fetchone()
-            count = int(row[0] if row else 0)
-            self._conn.execute("DELETE FROM reasoning_cache")
-            self._conn.commit()
-        return count
+        try:
+            with self._locked():
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) FROM reasoning_cache"
+                    ).fetchone()
+                    count = int(row[0] if row else 0)
+                    self._conn.execute("DELETE FROM reasoning_cache")
+                    self._conn.execute("COMMIT")
+                    return count
+                except sqlite3.Error as exc:
+                    self._fail_locked("clear", exc)
+                    return 0
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_cache_clear id=%s lock_timeout", request_id())
+            return 0
 
     def prune(self) -> int:
-        with self._lock:
-            deleted = self._prune_locked()
-            self._conn.commit()
-        return deleted
+        try:
+            with self._locked():
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    deleted = self._prune_locked()
+                    self._conn.execute("COMMIT")
+                    return deleted
+                except sqlite3.Error as exc:
+                    self._fail_locked("prune", exc)
+                    return 0
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_cache_prune id=%s lock_timeout", request_id())
+            return 0
 
     def _prune_locked(self) -> int:
+        """Drop expired rows, and overflow rows only when the table is over the cap.
+
+        The old ``DELETE ... NOT IN (SELECT ... LIMIT)`` sorted the whole table
+        on every write while holding the process-wide lock. On a warm cache that
+        stalled every later Cursor request before it reached DeepSeek.
+        """
         deleted = 0
         if self.max_age_seconds is not None and self.max_age_seconds > 0:
             cutoff = time.time() - self.max_age_seconds
@@ -326,20 +475,42 @@ class ReasoningStore:
                 "DELETE FROM reasoning_cache WHERE created_at < ?",
                 (cutoff,),
             )
-            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            try:
+                deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            finally:
+                cursor.close()
 
-        if self.max_rows is not None and self.max_rows > 0:
-            cursor = self._conn.execute(
-                """
-                DELETE FROM reasoning_cache
-                WHERE key NOT IN (
-                    SELECT key
-                    FROM reasoning_cache
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                )
-                """,
-                (self.max_rows,),
+        if self.max_rows is None or self.max_rows <= 0:
+            return deleted
+
+        cursor = self._conn.execute(
+            """
+            SELECT 1 FROM reasoning_cache
+            ORDER BY created_at ASC
+            LIMIT 1 OFFSET ?
+            """,
+            (self.max_rows,),
+        )
+        try:
+            over_cap = cursor.fetchone() is not None
+        finally:
+            cursor.close()
+        if not over_cap:
+            return deleted
+
+        cursor = self._conn.execute(
+            """
+            DELETE FROM reasoning_cache
+            WHERE rowid IN (
+                SELECT rowid FROM reasoning_cache
+                ORDER BY created_at ASC
+                LIMIT (SELECT COUNT(*) - ? FROM reasoning_cache)
             )
+            """,
+            (self.max_rows,),
+        )
+        try:
             deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+        finally:
+            cursor.close()
         return deleted

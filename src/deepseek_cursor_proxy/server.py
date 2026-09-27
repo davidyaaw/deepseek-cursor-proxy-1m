@@ -24,6 +24,8 @@ from .logging import (
     LOG,
     TerminalSpinner,
     configure_logging,
+    request_id,
+    set_request_id,
 )
 from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
@@ -95,6 +97,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         started = time.monotonic()
         request_path = urlparse(self.path).path
+        set_request_id(f"{time.time_ns()}")
+        self._arm_client_timeout()
+        LOG.info("request_start id=%s path=%s", request_id(), request_path)
         trace = self._start_trace(request_path)
         if self.config.verbose:
             LOG.info(
@@ -137,6 +142,18 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
             self._send_json(413, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=413, reason=str(exc))
+            return
+        except TimeoutError as exc:
+            LOG.warning(
+                "request_timeout id=%s path=%s while reading body: %s",
+                request_id(),
+                request_path,
+                exc,
+            )
+            self._send_json(
+                408, {"error": {"message": "Request timed out"}}, trace=trace
+            )
+            self._finish_trace(trace, "timeout", http_status=408)
             return
         except ValueError as exc:
             LOG.warning(
@@ -247,6 +264,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             if self.config.verbose:
                 LOG.info("forwarding to %s", upstream_url)
+            LOG.info(
+                "upstream_start id=%s stream=%s",
+                request_id(),
+                bool(prepared.payload.get("stream")),
+            )
             response = urlopen(request, timeout=self.config.request_timeout)
         except HTTPError as exc:
             spinner.stop()
@@ -267,7 +289,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         except URLError as exc:
             spinner.stop()
             LOG.warning(
-                "upstream request failed elapsed_ms=%s reason=%s",
+                "request_timeout id=%s upstream request failed elapsed_ms=%s reason=%s",
+                request_id(),
                 elapsed_ms(started),
                 exc.reason,
             )
@@ -357,6 +380,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         status: str,
         **extra: Any,
     ) -> None:
+        LOG.info("request_end id=%s status=%s", request_id(), status)
         if trace is None:
             return
         try:
@@ -425,10 +449,25 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             for name, value in headers:
                 self.send_header(name, value)
             self.end_headers()
-        except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
+        except (BrokenPipeError, ConnectionError, TimeoutError) as exc:
+            LOG.warning(
+                "request_cancelled id=%s while %s: %s",
+                request_id(),
+                disconnect_context,
+                exc,
+            )
             return False
         return True
+
+    def _arm_client_timeout(self) -> None:
+        """Stop a stalled Cursor socket from pinning a handler with no deadline."""
+        timeout = self.config.request_timeout
+        if not timeout or timeout <= 0:
+            return
+        try:
+            self.connection.settimeout(timeout)
+        except OSError:
+            return
 
     def _write_to_client(
         self,
@@ -441,8 +480,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             if flush:
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
+        except (BrokenPipeError, ConnectionError, TimeoutError) as exc:
+            LOG.warning(
+                "request_cancelled id=%s while %s: %s",
+                request_id(),
+                disconnect_context,
+                exc,
+            )
             return False
         return True
 
@@ -694,30 +738,43 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         )
         finalized = False
         pending_recovery_notice = recovery_notice
+        client_open = True
         try:
-            while True:
+            while client_open:
                 try:
                     line = response.readline()
                 except (HTTPException, OSError) as exc:
-                    LOG.warning("upstream streaming response read failed: %s", exc)
-                    return ProxyResponseResult(False, usage)
+                    LOG.warning(
+                        "upstream streaming response read failed id=%s: %s",
+                        request_id(),
+                        exc,
+                    )
+                    break
                 if not line:
                     break
-                (
-                    rewritten,
-                    finalized,
-                    pending_recovery_notice,
-                    chunk_usage,
-                ) = self._rewrite_sse_line(
-                    line,
-                    original_model,
-                    accumulator,
-                    cache_namespace,
-                    response_contexts,
-                    display_adapter,
-                    pending_recovery_notice,
-                    trace,
-                )
+                try:
+                    (
+                        rewritten,
+                        finalized,
+                        pending_recovery_notice,
+                        chunk_usage,
+                    ) = self._rewrite_sse_line(
+                        line,
+                        original_model,
+                        accumulator,
+                        cache_namespace,
+                        response_contexts,
+                        display_adapter,
+                        pending_recovery_notice,
+                        trace,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "exception id=%s rewriting stream: %s",
+                        request_id(),
+                        exc,
+                    )
+                    break
                 if chunk_usage is not None:
                     usage = chunk_usage
                 if trace is not None:
@@ -725,7 +782,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 if not self._write_to_client(
                     rewritten, "sending streaming response chunk", flush=True
                 ):
-                    return ProxyResponseResult(False, usage)
+                    client_open = False
+                    break
                 if finalized:
                     break
         finally:
@@ -738,21 +796,58 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     log_json(
                         "model streaming assistant messages", accumulator.messages()
                     )
-                stored = sum(
-                    accumulator.store_reasoning(
-                        self.reasoning_store,
-                        ctx_scope,
-                        cache_namespace,
-                        prior_messages,
+                try:
+                    stored = sum(
+                        accumulator.store_reasoning(
+                            self.reasoning_store,
+                            ctx_scope,
+                            cache_namespace,
+                            prior_messages,
+                        )
+                        for ctx_scope, prior_messages in response_contexts
                     )
-                    for ctx_scope, prior_messages in response_contexts
-                )
+                except Exception as exc:
+                    LOG.warning(
+                        "exception id=%s storing partial reasoning: %s",
+                        request_id(),
+                        exc,
+                    )
+                    stored = 0
                 if self.config.verbose and stored:
                     LOG.info(
                         "stored %s streaming reasoning cache key(s) before exit",
                         stored,
                     )
-        return ProxyResponseResult(True, usage)
+                if client_open:
+                    client_open = self._end_incomplete_stream(
+                        display_adapter, original_model
+                    )
+            LOG.info(
+                "upstream_end id=%s finalized=%s",
+                request_id(),
+                finalized,
+            )
+        return ProxyResponseResult(client_open, usage)
+
+    def _end_incomplete_stream(
+        self,
+        display_adapter: CursorReasoningDisplayAdapter | None,
+        original_model: str,
+    ) -> bool:
+        """Finish an SSE response that never received upstream [DONE]."""
+        if display_adapter is not None:
+            closing_chunk = display_adapter.flush_chunk(original_model)
+            if closing_chunk is not None and not self._write_to_client(
+                sse_data(closing_chunk),
+                "closing interrupted reasoning block",
+                flush=True,
+            ):
+                return False
+        return self._write_to_client(
+            b"data: [DONE]\n\n",
+            "sending stream terminator",
+            flush=True,
+        )
 
     def _rewrite_sse_line(
         self,
@@ -784,6 +879,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
             if self.config.verbose and stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
+            tool_calls = sum(
+                len(choice.tool_calls) for choice in accumulator.choices.values()
+            )
+            if tool_calls:
+                LOG.info("tool_call_end id=%s count=%s", request_id(), tool_calls)
             prefix = b""
             if display_adapter is None:
                 if recovery_notice:

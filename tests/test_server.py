@@ -304,7 +304,8 @@ class HandlerStubTests(unittest.TestCase):
         self.assertIn("sending streaming response chunk", "\n".join(captured.output))
 
     def test_streaming_response_handles_upstream_read_failure(self) -> None:
-        handler = _make_handler_stub(BytesIO())
+        wfile = BytesIO()
+        handler = _make_handler_stub(wfile)
         try:
             with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
                 result = handler._proxy_streaming_response(
@@ -315,7 +316,8 @@ class HandlerStubTests(unittest.TestCase):
                 )
         finally:
             handler.server.reasoning_store.close()
-        self.assertFalse(result.sent)
+        self.assertTrue(result.sent)
+        self.assertIn("data: [DONE]", wfile.getvalue().decode("utf-8"))
         self.assertIn(
             "upstream streaming response read failed", "\n".join(captured.output)
         )

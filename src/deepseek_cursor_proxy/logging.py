@@ -29,6 +29,19 @@ class ConsoleLogFormatter(stdlib_logging.Formatter):
         return self._warning_formatter.format(record)
 
 
+_request_state = threading.local()
+
+
+def set_request_id(request_id: str) -> None:
+    """Remember the current request's correlation id for this thread."""
+    _request_state.request_id = request_id
+
+
+def request_id() -> str:
+    """Return the correlation id for the request running on this thread."""
+    return str(getattr(_request_state, "request_id", "-"))
+
+
 def configure_logging(*, verbose: bool) -> None:
     handler = stdlib_logging.StreamHandler()
     handler.setFormatter(ConsoleLogFormatter(verbose=verbose))

@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from .config import ProxyConfig
-from .logging import LOG
+from .logging import LOG, request_id
 from .reasoning_store import (
     ReasoningStore,
     conversation_scope,
@@ -352,6 +352,13 @@ def normalize_message(
                             break
                 if needs_reasoning and not patched:
                     missing = True
+                if needs_reasoning:
+                    LOG.info(
+                        "reasoning_cache_%s id=%s hit_kind=%s",
+                        "hit" if patched else "miss",
+                        request_id(),
+                        hit_kind or "-",
+                    )
                 if needs_reasoning:
                     diagnostic = {
                         "message_index": len(prior_messages),
@@ -723,12 +730,29 @@ def assistant_needs_reasoning_for_tool_context(
     return False
 
 
+_ONE_M_CONTEXT_MARKER = re.compile(r"\[1m\]$", re.IGNORECASE)
+
+
 def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
-    if original_model.startswith("deepseek-"):
-        return original_model
+    # `[1m]` is a client-side context marker (Claude Code parses it to raise
+    # its local budget to 1M, Cherry Studio and other agents append it for
+    # backends that declare a >=1M window). DeepSeek's OpenAI-format API
+    # rejects the suffix, while `deepseek-flash` / `deepseek-v4-pro` serve 1M
+    # natively, so it is dropped before forwarding upstream. Keeping the
+    # normalization here also keeps the reasoning cache namespace identical
+    # whether or not the client decorates the model id.
+    model = _ONE_M_CONTEXT_MARKER.sub("", original_model.strip())
+    if model != original_model:
+        LOG.info(
+            "stripping client-side 1M context marker %r -> %r",
+            original_model,
+            model,
+        )
+    if model.startswith("deepseek-"):
+        return model
     LOG.warning(
         "rewriting non-DeepSeek model %r to configured fallback %r",
-        original_model,
+        model,
         config.upstream_model,
     )
     return config.upstream_model
@@ -898,7 +922,15 @@ def prepare_upstream_request(
             keep_reasoning=not thinking_disabled,
         )
     )
-    while missing_indexes and config.missing_reasoning_strategy == "recover":
+    # One or two passes cover a recovery boundary and then the latest user
+    # message. A hard cap guarantees a missed cache row cannot spin forever.
+    recovery_passes = 0
+    while (
+        missing_indexes
+        and config.missing_reasoning_strategy == "recover"
+        and recovery_passes < 4
+    ):
+        recovery_passes += 1
         recovered_messages, dropped_messages, notice, recovery_step = (
             recover_messages_from_missing_reasoning(messages, missing_indexes)
         )
