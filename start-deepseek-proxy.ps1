@@ -43,6 +43,18 @@ function Get-UvExe {
     throw 'uv not found. Install it: https://astral.sh/uv'
 }
 
+# Install the Cursor client fix. Asks for administrator once if Cursor is under Program Files.
+function Install-CursorFix {
+    Write-Host '  Installing Cursor fix so Composer and Grok keep the OpenAI key...' -ForegroundColor Cyan
+    $env:PYTHONPATH = Join-Path $ProxyDir 'src'
+    & $uv run --no-sync python -m deepseek_cursor_proxy.cursor_byok_patch
+    if ($LASTEXITCODE -eq 0) { return }
+    & $uv run python -m deepseek_cursor_proxy.cursor_byok_patch
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  Cursor fix was not installed. Composer and Grok need the OpenAI key turned off.' -ForegroundColor Yellow
+    }
+}
+
 # Tear down leftover ngrok agents so the port 4040 control API is free.
 function Reset-Ngrok {
     Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -100,7 +112,7 @@ function Show-Banner {
     Write-Host '   Paste into: Settings -> Models -> API Keys -> Override OpenAI Base URL' -ForegroundColor Gray
     Write-Host '   For 1M context: select GPT-5.6 Sol (or your deepseek-flash)' -ForegroundColor Gray
     Write-Host '   Model names:   GPT-5.6 Sol  |  deepseek-flash' -ForegroundColor Gray
-    Write-Host '   Toggle custom API:  Ctrl+Shift+0' -ForegroundColor Gray
+    Write-Host '   Composer and Grok keep working with the OpenAI key on.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   ------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host '   Keep this window open while working in Cursor.' -ForegroundColor DarkGray
@@ -118,6 +130,9 @@ if (-not (Test-Path $ProxyDir)) {
     exit 1
 }
 
+$uv = Get-UvExe
+Install-CursorFix
+
 # Already running? Show the current URL instead of starting a second copy.
 if (Test-ProxyUp) {
     $url = Get-TunnelBaseUrl
@@ -127,7 +142,6 @@ if (Test-ProxyUp) {
     return
 }
 
-$uv = Get-UvExe
 $env:PYTHONUNBUFFERED = '1'
 $env:UV_NO_PROGRESS    = '1'
 

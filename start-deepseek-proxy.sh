@@ -34,6 +34,22 @@ fi
 
 cd "$PROXY_DIR" || exit 1
 
+# Install the Cursor client fix before the proxy starts. macOS/Linux may need sudo for a system install.
+install_cursor_fix() {
+    echo "Installing Cursor fix so Composer and Grok keep the OpenAI key..."
+    export PYTHONPATH="$PROXY_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+    if uv run --no-sync python -m deepseek_cursor_proxy.cursor_byok_patch; then
+        return 0
+    fi
+    if uv run python -m deepseek_cursor_proxy.cursor_byok_patch; then
+        return 0
+    fi
+    echo "Cursor fix was not installed. Composer and Grok need the OpenAI key turned off." >&2
+    return 0
+}
+
+install_cursor_fix
+
 # --- Helpers -------------------------------------------------------------
 
 get_tunnel_url() {
@@ -75,7 +91,7 @@ show_banner() {
     printf '   Paste into: Settings -> Models -> API Keys -> Override OpenAI Base URL\n'
     printf '   For 1M context: select GPT-5.6 Sol (or your deepseek-flash)\n'
     printf '   Model names:   GPT-5.6 Sol  |  deepseek-flash\n'
-    printf '   Toggle custom API:  Cmd+Shift+0 (macOS) / Ctrl+Shift+0 (Linux)\n\n'
+    printf '   Composer and Grok keep working with the OpenAI key on.\n\n'
     printf '   ------------------------------------------------------------\n'
     printf '   Keep this terminal open while working in Cursor.\n'
     printf '   Press Ctrl+C to stop the proxy.\n'
