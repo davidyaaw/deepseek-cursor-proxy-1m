@@ -33,7 +33,7 @@ model: deepseek-flash
 1. **Settings → Models → API Keys**
 2. Turn on **Override OpenAI Base URL** and paste the URL from the launcher. It must end in `/v1`.
 3. Put your DeepSeek key (`sk-...`) in **OpenAI API Key**.
-4. Pick a model from the map below. Sol and Terra get Cursor's 1M budget; the proxy answers with DeepSeek. Cursor **Effort** is saved on each send and forwarded as DeepSeek `reasoning_effort` (Medium becomes `high`, Extra High becomes `max`).
+4. Pick a model and an **Effort** from the tables below. Sol and Terra get Cursor's 1M budget; the proxy answers with DeepSeek. Effort is saved per model on each send.
 5. The launcher installs a Cursor fix so Composer and Grok keep working while the OpenAI key stays on. Claude and Gemini already ignore that key. Other Cursor models still fail with it on. Windows may ask for administrator permission once. Quit Cursor and open it again after that.
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor API key and base URL settings">
@@ -52,6 +52,15 @@ A name that starts with `deepseek-` is sent to DeepSeek unchanged: `deepseek-v4-
 Any other name, besides Sol and Terra, is dropped. The proxy uses the `model:` line in `~/.deepseek-cursor-proxy/config.yaml`. That fallback is `deepseek-flash`. Set `model: deepseek-v4-pro` and restart the launcher when the fallback should be Pro.
 
 For normal use, pick two entries in Cursor: **GPT-5.6 Sol** is Pro, **GPT-5.6 Terra** is Flash.
+
+| Cursor Effort | DeepSeek |
+| --- | --- |
+| None | thinking off (`{"thinking": {"type": "disabled"}}`) |
+| Low | thinking on, `reasoning_effort: low` |
+| Medium, High | thinking on, `reasoning_effort: high` |
+| Extra High, Max | thinking on, `reasoning_effort: max` |
+
+**None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort in the same chat drops the previous thinking cache. The next reply can start with `[deepseek-cursor-proxy] Refreshed reasoning_content history.` Later replies keep the new thinking.
 
 ## Sub-agents
 

@@ -508,12 +508,21 @@ class ReasoningStore:
         prior_messages: list[dict[str, Any]] | None = None,
         lineage: str = "",
         root: str = "",
+        agent_id: str = "",
     ) -> int:
+        """Cache one assistant message.
+
+        Portable keys use this context's own prior messages. A recovered turn
+        is stored once for the full transcript and once for the shortened tail;
+        the next request looks the tail up with the tail's lineage.
+        """
         if message.get("role") != "assistant":
             return 0
         reasoning = message.get("reasoning_content")
         if not isinstance(reasoning, str):
             return 0
+        if prior_messages is not None:
+            lineage = conversation_lineage(prior_messages, agent_id)
 
         keys = scoped_reasoning_keys(message, scope)
         if prior_messages is not None:

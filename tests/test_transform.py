@@ -959,6 +959,8 @@ class CrossModeAndModelTests(unittest.TestCase):
             first_recovered.cache_namespace,
             content_prefix=first_recovered.recovery_notice,
             recording_contexts=first_recovered.record_response_contexts,
+            lineage=first_recovered.lineage,
+            agent_id=first_recovered.agent_id,
         )
         recovered_assistant = json.loads(rewritten)["choices"][0]["message"]
 
@@ -1051,6 +1053,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                 recording_contexts=prepared.record_response_contexts,
                 lineage=prepared.lineage,
                 root=prepared.root,
+                agent_id=prepared.agent_id,
             )
 
         for label, reasoning in (("A", "think A"), ("B", "think B")):
@@ -1126,6 +1129,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                 recording_contexts=prepared.record_response_contexts,
                 lineage=prepared.lineage,
                 root=prepared.root,
+                agent_id=prepared.agent_id,
             )
 
         roots = set()
@@ -1262,6 +1266,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                     recording_contexts=prepared.record_response_contexts,
                     lineage=prepared.lineage,
                     root=prepared.root,
+                    agent_id=prepared.agent_id,
                 )
                 barrier.wait(timeout=5)
                 follow_up = prepare_upstream_request(

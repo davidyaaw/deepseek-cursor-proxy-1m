@@ -141,6 +141,7 @@ class PreparedRequest:
     retired_prefix_messages: int = 0
     lineage: str = ""
     root: str = ""
+    agent_id: str = ""
     agent_id_source: str = "transcript"
     cursor_effort: str | None = None
 
@@ -1149,8 +1150,9 @@ def prepare_upstream_request(
             agent_id=resolved_agent_id,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
+    active_lineage = conversation_lineage(messages, resolved_agent_id)
     active_record_response_scope = conversation_scope(
-        messages, cache_namespace, lineage
+        messages, cache_namespace, active_lineage
     )
     record_response_contexts = response_recording_contexts(
         (record_response_scope, record_response_messages),
@@ -1177,6 +1179,7 @@ def prepare_upstream_request(
         retired_prefix_messages=retired_prefix_messages,
         lineage=lineage,
         root=root,
+        agent_id=resolved_agent_id,
         agent_id_source=agent_id_source,
         cursor_effort=requested_effort,
     )
@@ -1192,6 +1195,7 @@ def record_response_reasoning(
     recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     lineage: str = "",
     root: str = "",
+    agent_id: str = "",
 ) -> int:
     if store is None:
         return 0
@@ -1222,6 +1226,7 @@ def record_response_reasoning(
                     response_prior_messages,
                     lineage=lineage,
                     root=root,
+                    agent_id=agent_id,
                 )
     return stored
 
@@ -1240,6 +1245,7 @@ def rewrite_response_body(
     collapsible_reasoning: bool = True,
     lineage: str = "",
     root: str = "",
+    agent_id: str = "",
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
@@ -1255,6 +1261,7 @@ def rewrite_response_body(
             recording_contexts=recording_contexts,
             lineage=lineage,
             root=root,
+            agent_id=agent_id,
         )
         if display_reasoning:
             fold_reasoning_into_content(response_payload, collapsible_reasoning)

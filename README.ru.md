@@ -31,7 +31,7 @@ model: deepseek-flash
 1. **Settings → Models → API Keys**
 2. Включите **Override OpenAI Base URL** и вставьте адрес из лаунчера. В конце обязательно `/v1`.
 3. В **OpenAI API Key** вставьте ключ DeepSeek (`sk-...`).
-4. Выберите модель из таблицы ниже. Sol и Terra получают бюджет 1M от Cursor, отвечает DeepSeek. **Effort** сохраняется при каждой отправке и уходит в DeepSeek как `reasoning_effort` (Medium → `high`, Extra High → `max`).
+4. Выберите модель и **Effort** из таблиц ниже. Sol и Terra получают бюджет 1M от Cursor, отвечает DeepSeek. Effort сохраняется отдельно для каждой модели при каждой отправке.
 5. Лаунчер сам ставит правку: Composer и Grok работают при включённом ключе OpenAI. Claude и Gemini этот ключ и так не используют. Остальные модели Cursor с включённым ключом по-прежнему не запускаются. На Windows один раз может запросить права администратора. После этого полностью перезапустите Cursor.
 
 <img src="assets/cursor_config.png" width="600" alt="Настройки ключа и Base URL в Cursor">
@@ -50,6 +50,15 @@ model: deepseek-flash
 Любое другое имя, кроме Sol и Terra, прокси отбрасывает и берёт модель из `~/.deepseek-cursor-proxy/config.yaml`, строка `model:`. Сейчас это `deepseek-flash`. Чтобы запасной моделью был Pro, поставьте `model: deepseek-v4-pro` и перезапустите лаунчер.
 
 Для обычной работы достаточно двух пунктов в списке Cursor: **GPT-5.6 Sol** — Pro, **GPT-5.6 Terra** — Flash.
+
+| Effort в Cursor | DeepSeek |
+| --- | --- |
+| None | thinking выключен (`{"thinking": {"type": "disabled"}}`) |
+| Low | thinking включён, `reasoning_effort: low` |
+| Medium, High | thinking включён, `reasoning_effort: high` |
+| Extra High, Max | thinking включён, `reasoning_effort: max` |
+
+**None** — быстрый путь без reasoning-токенов. **High** — обычная работа агента. **Max** — самые трудные задачи. Смена модели или Effort в том же чате сбрасывает прошлый thinking. Следующий ответ может начаться с `[deepseek-cursor-proxy] Refreshed reasoning_content history.` Дальше сохраняется уже новый thinking.
 
 ## Субагенты
 

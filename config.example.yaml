@@ -22,9 +22,9 @@ model: deepseek-flash
 # DeepSeek thinking mode: enabled | disabled
 thinking: enabled
 
-# Fallback when Cursor has not reported an Effort yet.
-# The Cursor hook overwrites this with the picker value (low | medium | high | max | xhigh).
-# DeepSeek receives low | high | max (medium → high, xhigh → max).
+# Fallback when Cursor has not reported an Effort for this model yet.
+# The hook stores each model's Effort. None disables thinking. Otherwise
+# DeepSeek receives low | high | max (minimal → low, medium → high, xhigh → max).
 reasoning_effort: max
 
 # --- Cursor display ------------------------------------------------------

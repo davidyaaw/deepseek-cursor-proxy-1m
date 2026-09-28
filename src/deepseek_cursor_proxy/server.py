@@ -353,6 +353,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             record_response_contexts=prepared.record_response_contexts,
                             lineage=prepared.lineage,
                             root=prepared.root,
+                            agent_id=prepared.agent_id,
                         )
                     else:
                         sent_response = self._proxy_regular_response(
@@ -367,6 +368,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             record_response_contexts=prepared.record_response_contexts,
                             lineage=prepared.lineage,
                             root=prepared.root,
+                            agent_id=prepared.agent_id,
                         )
                     if not sent_response.sent:
                         spinner.stop()
@@ -640,6 +642,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
         lineage: str = "",
         root: str = "",
+        agent_id: str = "",
     ) -> ProxyResponseResult:
         body = read_response_body(response)
         upstream_body = body
@@ -659,6 +662,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 collapsible_reasoning=self.config.collapsible_reasoning,
                 lineage=lineage,
                 root=root,
+                agent_id=agent_id,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -715,6 +719,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
         lineage: str = "",
         root: str = "",
+        agent_id: str = "",
     ) -> ProxyResponseResult:
         if trace is not None:
             trace.record_upstream_response(
@@ -798,6 +803,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         trace,
                         lineage,
                         root,
+                        agent_id,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -836,6 +842,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             prior_messages,
                             lineage,
                             root,
+                            agent_id,
                         )
                         for ctx_scope, prior_messages in response_contexts
                     )
@@ -894,6 +901,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         trace: TraceRequest | None = None,
         lineage: str = "",
         root: str = "",
+        agent_id: str = "",
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         stripped = line.strip()
         if not stripped.startswith(b"data:"):
@@ -911,6 +919,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prior_messages,
                     lineage,
                     root,
+                    agent_id,
                 )
                 for scope, prior_messages in response_contexts
             )
@@ -954,6 +963,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     prior_messages,
                     lineage,
                     root,
+                    agent_id,
                 )
                 for scope, prior_messages in response_contexts
             )

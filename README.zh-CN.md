@@ -31,7 +31,7 @@ model: deepseek-flash
 1. 打开 **Settings → Models → API Keys**
 2. 启用 **Override OpenAI Base URL**，粘贴启动器给出的地址，必须以 `/v1` 结尾。
 3. 在 **OpenAI API Key** 中填入 DeepSeek 密钥（`sk-...`）。
-4. 按下表选择模型。Sol 和 Terra 使用 Cursor 的 1M 预算，实际由 DeepSeek 回答。每次发送时 Cursor 的 **Effort** 会保存并转成 DeepSeek 的 `reasoning_effort`（Medium 变为 `high`，Extra High 变为 `max`）。
+4. 按下表选择模型和 **Effort**。Sol 和 Terra 使用 Cursor 的 1M 预算，实际由 DeepSeek 回答。每次发送时，Effort 会按模型分别保存。
 5. 启动器会自动安装修复，这样在开启 OpenAI 密钥时 Composer 和 Grok 仍可使用。Claude 和 Gemini 本来就不使用这把密钥。其他 Cursor 模型在密钥开启时仍然无法使用。Windows 可能询问一次管理员权限。之后请完全退出并重新打开 Cursor。
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor 中的 API 密钥和 Base URL 设置">
@@ -50,6 +50,15 @@ model: deepseek-flash
 除了 Sol 和 Terra，其他名称会被丢掉。代理改用 `~/.deepseek-cursor-proxy/config.yaml` 里的 `model:`。现在的后备模型是 `deepseek-flash`。若要改成 Pro，写成 `model: deepseek-v4-pro`，然后重启启动器。
 
 平时在 Cursor 里选两项即可：**GPT-5.6 Sol** 是 Pro，**GPT-5.6 Terra** 是 Flash。
+
+| Cursor Effort | DeepSeek |
+| --- | --- |
+| None | 关闭 thinking（`{"thinking": {"type": "disabled"}}`） |
+| Low | 开启 thinking，`reasoning_effort: low` |
+| Medium、High | 开启 thinking，`reasoning_effort: high` |
+| Extra High、Max | 开启 thinking，`reasoning_effort: max` |
+
+**None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。在同一对话里切换模型或 Effort 会丢掉之前的 thinking。下一条回复可能以 `[deepseek-cursor-proxy] Refreshed reasoning_content history.` 开头。之后会保留新的 thinking。
 
 ## 子代理
 
