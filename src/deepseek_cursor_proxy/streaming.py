@@ -78,11 +78,22 @@ class StreamAccumulator:
         scope: str,
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> int:
+        """Cache completed reasoning for one agent conversation."""
         stored = 0
         for index, choice in self.choices.items():
             stored += self._store_choice(
-                index, choice, store, scope, "final", cache_namespace, prior_messages
+                index,
+                choice,
+                store,
+                scope,
+                "final",
+                cache_namespace,
+                prior_messages,
+                lineage,
+                root,
             )
         return stored
 
@@ -92,6 +103,8 @@ class StreamAccumulator:
         scope: str,
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> int:
         stored = 0
         for index, choice in self.choices.items():
@@ -104,6 +117,8 @@ class StreamAccumulator:
                     "final",
                     cache_namespace,
                     prior_messages,
+                    lineage,
+                    root,
                 )
         return stored
 
@@ -113,7 +128,10 @@ class StreamAccumulator:
         scope: str,
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> int:
+        """Cache reasoning as soon as a tool call has an id, before [DONE]."""
         stored = 0
         for index, choice in self.choices.items():
             if choice.finish_reason is not None:
@@ -125,6 +143,8 @@ class StreamAccumulator:
                     "final",
                     cache_namespace,
                     prior_messages,
+                    lineage,
+                    root,
                 )
             elif self._has_identified_tool_calls(choice):
                 stored += self._store_choice(
@@ -135,6 +155,8 @@ class StreamAccumulator:
                     "tool_call",
                     cache_namespace,
                     prior_messages,
+                    lineage,
+                    root,
                 )
         return stored
 
@@ -189,6 +211,8 @@ class StreamAccumulator:
         stage: str = "final",
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> int:
         stage_rank = {"tool_call": 1, "final": 2}
         storage_key = (index, scope)
@@ -200,6 +224,8 @@ class StreamAccumulator:
             scope,
             cache_namespace,
             prior_messages,
+            lineage=lineage,
+            root=root,
         )
         if stored:
             self._stored_choices[storage_key] = stage

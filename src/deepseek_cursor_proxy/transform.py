@@ -10,8 +10,11 @@ from .config import ProxyConfig
 from .logging import LOG, request_id
 from .reasoning_store import (
     ReasoningStore,
+    agent_root,
+    conversation_lineage,
     conversation_scope,
     message_signature,
+    portable_key_prefix,
     tool_call_ids,
     tool_call_names,
     tool_call_signature,
@@ -122,6 +125,9 @@ class PreparedRequest:
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
+    lineage: str = ""
+    root: str = ""
+    agent_id_source: str = "transcript"
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -286,6 +292,7 @@ def normalize_message(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    agent_id: str = "",
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -316,19 +323,25 @@ def normalize_message(
         if not keep_reasoning:
             normalized.pop("reasoning_content", None)
         elif repair_reasoning:
+            # User text before this message. Later user messages in the same
+            # request belong to a newer turn and must not retarget this lookup.
+            lineage = conversation_lineage(prior_messages, agent_id)
             reasoning = normalized.get("reasoning_content")
             if not isinstance(reasoning, str):
                 normalized.pop("reasoning_content", None)
                 needs_reasoning = assistant_needs_reasoning_for_tool_context(
                     normalized, prior_messages
                 )
-                lookup_scope = conversation_scope(prior_messages, cache_namespace)
+                lookup_scope = conversation_scope(
+                    prior_messages, cache_namespace, lineage
+                )
                 lookup_keys = (
                     reasoning_lookup_keys(
                         normalized,
                         lookup_scope,
                         cache_namespace,
                         prior_messages,
+                        lineage,
                     )
                     if needs_reasoning
                     else []
@@ -348,15 +361,18 @@ def normalize_message(
                                     restored,
                                     cache_namespace,
                                     prior_messages,
+                                    lineage,
+                                    agent_root(prior_messages, agent_id),
                                 )
                             break
                 if needs_reasoning and not patched:
                     missing = True
                 if needs_reasoning:
                     LOG.info(
-                        "reasoning_cache_%s id=%s hit_kind=%s",
+                        "reasoning_cache_%s id=%s lineage=%s hit_kind=%s",
                         "hit" if patched else "miss",
                         request_id(),
+                        (lineage or "-")[:16],
                         hit_kind or "-",
                     )
                 if needs_reasoning:
@@ -381,7 +397,9 @@ def normalize_message(
                     "had_reasoning_content": True,
                     "patched": False,
                     "missing": False,
-                    "lookup_scope": conversation_scope(prior_messages, cache_namespace),
+                    "lookup_scope": conversation_scope(
+                        prior_messages, cache_namespace, lineage
+                    ),
                     "message_signature": message_signature(normalized),
                     "tool_call_ids": tool_call_ids(normalized),
                     "lookup_keys": [],
@@ -400,6 +418,7 @@ def reasoning_lookup_keys(
     scope: str,
     cache_namespace: str = "",
     prior_messages: list[dict[str, Any]] | None = None,
+    lineage: str = "",
 ) -> list[dict[str, Any]]:
     keys = [
         {
@@ -444,15 +463,14 @@ def reasoning_lookup_keys(
         for tool_name in tool_call_names(message)
     )
     if cache_namespace and prior_messages is not None:
+        prefix = portable_key_prefix(cache_namespace, prior_messages, lineage)
         turn_signature = turn_context_signature(prior_messages)
         keys.append(
             {
                 "kind": "portable_message_signature",
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"signature:{message_signature(message)}"
-                ),
+                "key": f"{prefix}signature:{message_signature(message)}",
                 "turn_context_signature": turn_signature,
+                "lineage": lineage or conversation_lineage(prior_messages),
                 "portable": True,
                 "hit": False,
             }
@@ -461,10 +479,7 @@ def reasoning_lookup_keys(
             {
                 "kind": "portable_tool_call_id",
                 "tool_call_id": tool_call_id,
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_call:{tool_call_id}"
-                ),
+                "key": f"{prefix}tool_call:{tool_call_id}",
                 "turn_context_signature": turn_signature,
                 "portable": True,
                 "hit": False,
@@ -478,8 +493,7 @@ def reasoning_lookup_keys(
                     (tool_call.get("function") or {}).get("name") or ""
                 ),
                 "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_call_signature:{tool_call_signature(tool_call)}"
+                    f"{prefix}tool_call_signature:{tool_call_signature(tool_call)}"
                 ),
                 "turn_context_signature": turn_signature,
                 "portable": True,
@@ -492,10 +506,7 @@ def reasoning_lookup_keys(
             {
                 "kind": "portable_tool_name",
                 "function_name": tool_name,
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_name:{tool_name}"
-                ),
+                "key": f"{prefix}tool_name:{tool_name}",
                 "turn_context_signature": turn_signature,
                 "portable": True,
                 "hit": False,
@@ -511,6 +522,7 @@ def normalize_messages(
     cache_namespace: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
+    agent_id: str = "",
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
@@ -526,6 +538,7 @@ def normalize_messages(
             cache_namespace,
             repair_reasoning,
             keep_reasoning,
+            agent_id,
         )
         normalized_messages.append(normalized)
         if patched:
@@ -803,11 +816,93 @@ def response_recording_contexts(
     return contexts
 
 
+# Read for agent isolation, then omitted from the DeepSeek request.
+_CONSUMED_REQUEST_FIELDS = {
+    "max_completion_tokens",
+    "functions",
+    "function_call",
+    "metadata",
+    "conversation_id",
+    "agent_id",
+    "subagent_id",
+    "prompt_cache_key",
+}
+
+_AGENT_HEADER_NAMES = (
+    "x-cursor-conversation-id",
+    "x-conversation-id",
+    "x-agent-id",
+    "x-cursor-agent-id",
+    "x-subagent-id",
+    "x-cursor-subagent-id",
+)
+
+_AGENT_METADATA_KEYS = (
+    "conversation_id",
+    "conversationId",
+    "agent_id",
+    "agentId",
+    "subagent_id",
+    "subagentId",
+    "composer_id",
+    "composerId",
+    "parent_conversation_id",
+    "parentConversationId",
+)
+
+
+def _header_value(headers: Any, name: str) -> str:
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return ""
+    value = getter(name)
+    if not value:
+        value = getter(name.lower())
+    return str(value).strip() if value else ""
+
+
+def resolve_agent_id(
+    payload: dict[str, Any] | None,
+    headers: Any = None,
+) -> tuple[str, str]:
+    """Read a Cursor conversation or sub-agent id from the request.
+
+    Per-request ids are ignored. Native Cursor models isolate thinking by
+    conversation id; this is the same id when the client sends it.
+    """
+    parts: list[str] = []
+    sources: list[str] = []
+    if headers is not None:
+        for name in _AGENT_HEADER_NAMES:
+            value = _header_value(headers, name)
+            if value:
+                parts.append(f"{name}={value}")
+                sources.append(f"header:{name}")
+    body = payload if isinstance(payload, dict) else {}
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in _AGENT_METADATA_KEYS:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(f"{key}={value.strip()}")
+                sources.append(f"metadata:{key}")
+    for key in ("conversation_id", "agent_id", "subagent_id", "prompt_cache_key"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={value.strip()}")
+            sources.append(f"field:{key}")
+    if not parts:
+        return "", "transcript"
+    return "\n".join(parts), ",".join(sources)
+
+
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
     store: ReasoningStore | None,
     authorization: str | None = None,
+    agent_id: str = "",
+    headers: Any = None,
 ) -> PreparedRequest:
     original_model = str(payload.get("model") or config.upstream_model)
     upstream_model = upstream_model_for(original_model, config)
@@ -819,7 +914,7 @@ def prepare_upstream_request(
         key
         for key in payload.keys()
         if key not in SUPPORTED_REQUEST_FIELDS
-        and key not in {"max_completion_tokens", "functions", "function_call"}
+        and key not in _CONSUMED_REQUEST_FIELDS
     )
     if dropped_fields:
         LOG.warning(
@@ -888,6 +983,10 @@ def prepare_upstream_request(
         prepared.get("reasoning_effort"),
         authorization,
     )
+    resolved_agent_id, agent_id_source = resolve_agent_id(payload, headers)
+    if agent_id:
+        resolved_agent_id = agent_id
+        agent_id_source = "caller"
     pre_repair_messages, _, _, _ = normalize_messages(
         payload.get("messages"),
         None,
@@ -896,8 +995,16 @@ def prepare_upstream_request(
         keep_reasoning=not thinking_disabled,
     )
     record_response_messages = pre_repair_messages
+    root = agent_root(pre_repair_messages, resolved_agent_id)
+    lineage = conversation_lineage(pre_repair_messages, resolved_agent_id)
+    LOG.info(
+        "agent_lineage id=%s root=%s source=%s",
+        request_id(),
+        root[:16],
+        agent_id_source,
+    )
     record_response_scope = conversation_scope(
-        record_response_messages, cache_namespace
+        record_response_messages, cache_namespace, lineage
     )
     messages_for_repair = pre_repair_messages
     continued_recovery_boundary = False
@@ -920,6 +1027,7 @@ def prepare_upstream_request(
             cache_namespace,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
+            agent_id=resolved_agent_id,
         )
     )
     # One or two passes cover a recovery boundary and then the latest user
@@ -952,9 +1060,12 @@ def prepare_upstream_request(
             cache_namespace,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
+            agent_id=resolved_agent_id,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
-    active_record_response_scope = conversation_scope(messages, cache_namespace)
+    active_record_response_scope = conversation_scope(
+        messages, cache_namespace, lineage
+    )
     record_response_contexts = response_recording_contexts(
         (record_response_scope, record_response_messages),
         (active_record_response_scope, messages),
@@ -978,6 +1089,9 @@ def prepare_upstream_request(
         recovery_steps=recovery_steps,
         continued_recovery_boundary=continued_recovery_boundary,
         retired_prefix_messages=retired_prefix_messages,
+        lineage=lineage,
+        root=root,
+        agent_id_source=agent_id_source,
     )
 
 
@@ -989,6 +1103,8 @@ def record_response_reasoning(
     scope: str | None = None,
     prior_messages: list[dict[str, Any]] | None = None,
     recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
+    lineage: str = "",
+    root: str = "",
 ) -> int:
     if store is None:
         return 0
@@ -1000,7 +1116,7 @@ def record_response_reasoning(
         response_scope = (
             scope
             if scope is not None
-            else conversation_scope(request_messages, cache_namespace)
+            else conversation_scope(request_messages, cache_namespace, lineage)
         )
         response_prior_messages = (
             prior_messages if prior_messages is not None else request_messages
@@ -1017,6 +1133,8 @@ def record_response_reasoning(
                     response_scope,
                     cache_namespace,
                     response_prior_messages,
+                    lineage=lineage,
+                    root=root,
                 )
     return stored
 
@@ -1033,6 +1151,8 @@ def rewrite_response_body(
     recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
     display_reasoning: bool = False,
     collapsible_reasoning: bool = True,
+    lineage: str = "",
+    root: str = "",
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
@@ -1046,6 +1166,8 @@ def rewrite_response_body(
             scope=scope,
             prior_messages=prior_messages,
             recording_contexts=recording_contexts,
+            lineage=lineage,
+            root=root,
         )
         if display_reasoning:
             fold_reasoning_into_content(response_payload, collapsible_reasoning)

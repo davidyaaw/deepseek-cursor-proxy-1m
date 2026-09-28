@@ -9,11 +9,13 @@ recovery-notice stripping, and warning behaviour for dropped fields.
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import (
     ReasoningStore,
+    conversation_lineage,
     conversation_scope,
     message_signature,
 )
@@ -570,10 +572,15 @@ class CrossModeAndModelTests(unittest.TestCase):
             "reasoning_content": "Need README before answering.",
             "tool_calls": [tool_call],
         }
-        # Store under Agent scope only — no portable aliases yet.
+        # Store under the Agent scope the proxy writes: the user-message
+        # lineage is part of the hash, and portable aliases are not yet.
         self.store.store_assistant_message(
             assistant_message,
-            _cache_scope(agent_prior),
+            conversation_scope(
+                agent_prior,
+                _default_cache_namespace(),
+                conversation_lineage(agent_prior),
+            ),
         )
 
         # Agent re-request: strict scope hit, should backfill portable.
@@ -843,6 +850,299 @@ class CrossModeAndModelTests(unittest.TestCase):
             second_prepared.payload["messages"][2]["reasoning_content"],
             "Need the new lookup.",
         )
+
+    def test_parallel_subagents_do_not_share_reasoning_after_system_churn(self) -> None:
+        """Each sub-agent keeps its own thinking when Cursor rewrites the system
+        prompt. The shared tail ("continue") must not collapse their caches."""
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "Read", "arguments": "{}"},
+        }
+
+        def history(label: str, system: str) -> list[dict]:
+            return [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"task {label}"},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": "continue"},
+            ]
+
+        for label, reasoning in (("A", "think A"), ("B", "think B")):
+            prepared = prepare_upstream_request(
+                {
+                    "model": "deepseek-v4-pro",
+                    "messages": history(label, f"sys {label} t=1"),
+                },
+                ProxyConfig(),
+                self.store,
+            )
+            rewrite_response_body(
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "reasoning_content": reasoning,
+                                    "tool_calls": [tool_call],
+                                }
+                            }
+                        ]
+                    }
+                ).encode(),
+                "deepseek-v4-pro",
+                self.store,
+                prepared.payload["messages"],
+                prepared.cache_namespace,
+                recording_contexts=prepared.record_response_contexts,
+                lineage=prepared.lineage,
+                root=prepared.root,
+            )
+
+        for label, reasoning in (("A", "think A"), ("B", "think B")):
+            follow_up = prepare_upstream_request(
+                {
+                    "model": "deepseek-v4-pro",
+                    "messages": [
+                        *history(label, f"sys {label} t=2"),
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [tool_call],
+                        },
+                    ],
+                },
+                ProxyConfig(),
+                self.store,
+            )
+            self.assertEqual(
+                follow_up.payload["messages"][-1].get("reasoning_content"),
+                reasoning,
+            )
+            self.assertNotEqual(follow_up.lineage, "")
+            self.assertNotEqual(follow_up.root, "")
+
+    def test_explicit_subagent_id_isolates_identical_transcripts(self) -> None:
+        """Same prompt text stays isolated when Cursor sends a sub-agent id."""
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "Read", "arguments": "{}"},
+        }
+        transcript = [
+            {"role": "system", "content": "You are running as a subagent."},
+            {"role": "user", "content": "continue"},
+        ]
+
+        def prepare(agent_id: str, system: str) -> object:
+            return prepare_upstream_request(
+                {
+                    "model": "deepseek-v4-pro",
+                    "metadata": {"subagent_id": agent_id},
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": "continue"},
+                    ],
+                },
+                ProxyConfig(),
+                self.store,
+            )
+
+        for agent_id, reasoning in (("sub-a", "think A"), ("sub-b", "think B")):
+            prepared = prepare(agent_id, "sys t=1")
+            rewrite_response_body(
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "reasoning_content": reasoning,
+                                    "tool_calls": [tool_call],
+                                }
+                            }
+                        ]
+                    }
+                ).encode(),
+                "deepseek-v4-pro",
+                self.store,
+                prepared.payload["messages"],
+                prepared.cache_namespace,
+                recording_contexts=prepared.record_response_contexts,
+                lineage=prepared.lineage,
+                root=prepared.root,
+            )
+
+        roots = set()
+        for agent_id, reasoning in (("sub-a", "think A"), ("sub-b", "think B")):
+            follow_up = prepare_upstream_request(
+                {
+                    "model": "deepseek-v4-pro",
+                    "metadata": {"subagent_id": agent_id},
+                    "messages": [
+                        {"role": "system", "content": "sys t=2"},
+                        *transcript[1:],
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [tool_call],
+                        },
+                    ],
+                },
+                ProxyConfig(),
+                self.store,
+            )
+            roots.add(follow_up.root)
+            self.assertEqual(
+                follow_up.payload["messages"][-1].get("reasoning_content"),
+                reasoning,
+            )
+        self.assertEqual(len(roots), 2)
+
+    def test_request_id_does_not_split_one_conversation(self) -> None:
+        """x-request-id changes every HTTP call and must not become the agent id."""
+        tool_call = {
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "Read", "arguments": "{}"},
+        }
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "system", "content": "sys t=1"},
+                    {"role": "user", "content": "same task"},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+            headers={"x-request-id": "req-1"},
+        )
+        rewrite_response_body(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "think once",
+                                "tool_calls": [tool_call],
+                            }
+                        }
+                    ]
+                }
+            ).encode(),
+            "deepseek-v4-pro",
+            self.store,
+            prepared.payload["messages"],
+            prepared.cache_namespace,
+            recording_contexts=prepared.record_response_contexts,
+            lineage=prepared.lineage,
+            root=prepared.root,
+        )
+        follow_up = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "system", "content": "sys t=2"},
+                    {"role": "user", "content": "same task"},
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+            headers={"x-request-id": "req-2"},
+        )
+        self.assertEqual(follow_up.agent_id_source, "transcript")
+        self.assertEqual(follow_up.root, prepared.root)
+        self.assertEqual(
+            follow_up.payload["messages"][-1].get("reasoning_content"),
+            "think once",
+        )
+
+    def test_concurrent_subagents_do_not_cross_read(self) -> None:
+        """Parallel requests keep the reasoning written by their own agent."""
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(3)
+
+        def run(label: str) -> None:
+            try:
+                tool_call = {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{}"},
+                }
+                prepared = prepare_upstream_request(
+                    {
+                        "model": "deepseek-v4-pro",
+                        "metadata": {"subagent_id": label},
+                        "messages": [
+                            {"role": "system", "content": "sys"},
+                            {"role": "user", "content": "same task"},
+                        ],
+                    },
+                    ProxyConfig(),
+                    self.store,
+                )
+                rewrite_response_body(
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "reasoning_content": f"think {label}",
+                                        "tool_calls": [tool_call],
+                                    }
+                                }
+                            ]
+                        }
+                    ).encode(),
+                    "deepseek-v4-pro",
+                    self.store,
+                    prepared.payload["messages"],
+                    prepared.cache_namespace,
+                    recording_contexts=prepared.record_response_contexts,
+                    lineage=prepared.lineage,
+                    root=prepared.root,
+                )
+                barrier.wait(timeout=5)
+                follow_up = prepare_upstream_request(
+                    {
+                        "model": "deepseek-v4-pro",
+                        "metadata": {"subagent_id": label},
+                        "messages": [
+                            {"role": "system", "content": "sys changed"},
+                            {"role": "user", "content": "same task"},
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [tool_call],
+                            },
+                        ],
+                    },
+                    ProxyConfig(),
+                    self.store,
+                )
+                got = follow_up.payload["messages"][-1].get("reasoning_content")
+                if got != f"think {label}":
+                    errors.append(AssertionError(f"{label}: {got}"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=(label,)) for label in ("A", "B", "C")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
 
 
 class StopMidStreamingToolCallTests(unittest.TestCase):

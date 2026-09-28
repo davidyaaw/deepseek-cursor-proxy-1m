@@ -12,7 +12,7 @@ import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 import zlib
 
 from .config import (
@@ -31,6 +31,7 @@ from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
 from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
+from .upstream import open_upstream
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
     prepare_upstream_request,
@@ -176,188 +177,199 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self.config,
             self.reasoning_store,
             authorization=cursor_authorization,
+            headers=self.headers,
         )
-        if trace is not None:
-            trace.record_transform(prepared)
-        log_context_summary(prepared)
-        if (
-            prepared.missing_reasoning_messages
-            and self.config.missing_reasoning_strategy == "reject"
-        ):
-            LOG.warning(
-                (
-                    "strict missing-reasoning mode rejected request path=%s "
-                    "status=409 reason=missing_reasoning_content count=%s"
-                ),
-                request_path,
-                prepared.missing_reasoning_messages,
-            )
-            self._send_json(
-                409,
-                {
-                    "error": {
-                        "message": (
-                            "deepseek-cursor-proxy is running in strict "
-                            "missing-reasoning mode and cannot automatically "
-                            "recover this thinking-mode tool-call history because "
-                            "cached DeepSeek reasoning_content is missing for "
-                            f"{prepared.missing_reasoning_messages} assistant "
-                            "message(s). Restart without "
-                            "`--missing-reasoning-strategy reject`, or pass "
-                            "`--missing-reasoning-strategy recover`, so the proxy "
-                            "can recover from partial chat history automatically."
-                        ),
-                        "type": "missing_reasoning_content",
-                        "code": "missing_reasoning_content",
-                        "missing_reasoning_messages": prepared.missing_reasoning_messages,
-                    }
-                },
-                trace=trace,
-            )
-            self._finish_trace(trace, "rejected", http_status=409)
-            return
-
-        if self.config.verbose:
-            LOG.info(
-                (
-                    "upstream request metadata: original_model=%s upstream_model=%s "
-                    "patched_reasoning=%s missing_reasoning=%s %s"
-                ),
-                prepared.original_model,
-                prepared.upstream_model,
-                prepared.patched_reasoning_messages,
-                prepared.missing_reasoning_messages,
-                summarize_chat_payload(prepared.payload),
-            )
-
-        if self.config.verbose:
-            log_json("upstream request body", prepared.payload)
-
-        upstream_body = json.dumps(
-            prepared.payload, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-        upstream_url = f"{self.config.upstream_base_url}/chat/completions"
-        upstream_headers = self._upstream_headers(
-            stream=bool(prepared.payload.get("stream")),
-            authorization=cursor_authorization,
-        )
-        if trace is not None:
-            trace.record_upstream_request(
-                url=upstream_url,
-                headers=upstream_headers,
-                body_bytes=upstream_body,
-            )
-        request = Request(
-            upstream_url,
-            data=upstream_body,
-            method="POST",
-            headers=upstream_headers,
-        )
-
-        if self.config.verbose:
-            log_send_summary(prepared)
-        spinner = TerminalSpinner(
-            enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
-            text="└ {frame}",
-        ).start()
-
+        self.reasoning_store.acquire(prepared.root)
         try:
+            if trace is not None:
+                trace.record_transform(prepared)
+            log_context_summary(prepared)
+            if (
+                prepared.missing_reasoning_messages
+                and self.config.missing_reasoning_strategy == "reject"
+            ):
+                LOG.warning(
+                    (
+                        "strict missing-reasoning mode rejected request path=%s "
+                        "status=409 reason=missing_reasoning_content count=%s"
+                    ),
+                    request_path,
+                    prepared.missing_reasoning_messages,
+                )
+                self._send_json(
+                    409,
+                    {
+                        "error": {
+                            "message": (
+                                "deepseek-cursor-proxy is running in strict "
+                                "missing-reasoning mode and cannot automatically "
+                                "recover this thinking-mode tool-call history because "
+                                "cached DeepSeek reasoning_content is missing for "
+                                f"{prepared.missing_reasoning_messages} assistant "
+                                "message(s). Restart without "
+                                "`--missing-reasoning-strategy reject`, or pass "
+                                "`--missing-reasoning-strategy recover`, so the proxy "
+                                "can recover from partial chat history automatically."
+                            ),
+                            "type": "missing_reasoning_content",
+                            "code": "missing_reasoning_content",
+                            "missing_reasoning_messages": prepared.missing_reasoning_messages,
+                        }
+                    },
+                    trace=trace,
+                )
+                self._finish_trace(trace, "rejected", http_status=409)
+                return
+
             if self.config.verbose:
-                LOG.info("forwarding to %s", upstream_url)
-            LOG.info(
-                "upstream_start id=%s stream=%s",
-                request_id(),
-                bool(prepared.payload.get("stream")),
-            )
-            response = urlopen(request, timeout=self.config.request_timeout)
-        except HTTPError as exc:
-            spinner.stop()
-            LOG.warning(
-                "request failed upstream_status=%s stream=%s elapsed_ms=%s",
-                exc.code,
-                bool(prepared.payload.get("stream")),
-                elapsed_ms(started),
-            )
-            self._send_upstream_error(exc, trace=trace)
-            self._finish_trace(
-                trace,
-                "upstream_error",
-                http_status=exc.code,
-                stream=bool(prepared.payload.get("stream")),
-            )
-            return
-        except URLError as exc:
-            spinner.stop()
-            LOG.warning(
-                "request_timeout id=%s upstream request failed elapsed_ms=%s reason=%s",
-                request_id(),
-                elapsed_ms(started),
-                exc.reason,
-            )
-            self._send_json(
-                502,
-                {"error": {"message": f"Upstream request failed: {exc.reason}"}},
-                trace=trace,
-            )
-            self._finish_trace(trace, "upstream_error", http_status=502)
-            return
-        except Exception:
-            spinner.stop()
-            raise
+                LOG.info(
+                    (
+                        "upstream request metadata: original_model=%s upstream_model=%s "
+                        "patched_reasoning=%s missing_reasoning=%s %s"
+                    ),
+                    prepared.original_model,
+                    prepared.upstream_model,
+                    prepared.patched_reasoning_messages,
+                    prepared.missing_reasoning_messages,
+                    summarize_chat_payload(prepared.payload),
+                )
 
-        try:
-            with response:
-                upstream_status = getattr(response, "status", 200)
+            if self.config.verbose:
+                log_json("upstream request body", prepared.payload)
+
+            upstream_body = json.dumps(
+                prepared.payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            upstream_url = f"{self.config.upstream_base_url}/chat/completions"
+            upstream_headers = self._upstream_headers(
+                stream=bool(prepared.payload.get("stream")),
+                authorization=cursor_authorization,
+            )
+            if trace is not None:
+                trace.record_upstream_request(
+                    url=upstream_url,
+                    headers=upstream_headers,
+                    body_bytes=upstream_body,
+                )
+            request = Request(
+                upstream_url,
+                data=upstream_body,
+                method="POST",
+                headers=upstream_headers,
+            )
+
+            if self.config.verbose:
+                log_send_summary(prepared)
+            spinner = TerminalSpinner(
+                enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
+                text="└ {frame}",
+            ).start()
+
+            try:
                 if self.config.verbose:
-                    LOG.info(
-                        "upstream response status=%s stream=%s elapsed_ms=%s",
-                        upstream_status,
-                        bool(prepared.payload.get("stream")),
-                        elapsed_ms(started),
-                    )
-                if prepared.payload.get("stream"):
-                    sent_response = self._proxy_streaming_response(
-                        response,
-                        prepared.original_model,
-                        prepared.payload["messages"],
-                        prepared.cache_namespace,
-                        prepared.recovery_notice,
-                        trace=trace,
-                        record_response_scope=prepared.record_response_scope,
-                        record_response_messages=prepared.record_response_messages,
-                        record_response_contexts=prepared.record_response_contexts,
-                    )
-                else:
-                    sent_response = self._proxy_regular_response(
-                        response,
-                        prepared.original_model,
-                        prepared.payload["messages"],
-                        prepared.cache_namespace,
-                        prepared.recovery_notice,
-                        trace=trace,
-                        record_response_scope=prepared.record_response_scope,
-                        record_response_messages=prepared.record_response_messages,
-                        record_response_contexts=prepared.record_response_contexts,
-                    )
-                if not sent_response.sent:
+                    LOG.info("forwarding to %s", upstream_url)
+                LOG.info(
+                    "upstream_start id=%s stream=%s",
+                    request_id(),
+                    bool(prepared.payload.get("stream")),
+                )
+                response = open_upstream(
+                    request, read_timeout=self.config.request_timeout
+                )
+            except HTTPError as exc:
+                spinner.stop()
+                LOG.warning(
+                    "request failed upstream_status=%s stream=%s elapsed_ms=%s",
+                    exc.code,
+                    bool(prepared.payload.get("stream")),
+                    elapsed_ms(started),
+                )
+                self._send_upstream_error(exc, trace=trace)
+                self._finish_trace(
+                    trace,
+                    "upstream_error",
+                    http_status=exc.code,
+                    stream=bool(prepared.payload.get("stream")),
+                )
+                return
+            except URLError as exc:
+                spinner.stop()
+                LOG.warning(
+                    "request_timeout id=%s upstream request failed elapsed_ms=%s reason=%s",
+                    request_id(),
+                    elapsed_ms(started),
+                    exc.reason,
+                )
+                self._send_json(
+                    502,
+                    {"error": {"message": f"Upstream request failed: {exc.reason}"}},
+                    trace=trace,
+                )
+                self._finish_trace(trace, "upstream_error", http_status=502)
+                return
+            except Exception:
+                spinner.stop()
+                raise
+
+            try:
+                with response:
+                    upstream_status = getattr(response, "status", 200)
+                    if self.config.verbose:
+                        LOG.info(
+                            "upstream response status=%s stream=%s elapsed_ms=%s",
+                            upstream_status,
+                            bool(prepared.payload.get("stream")),
+                            elapsed_ms(started),
+                        )
+                    if prepared.payload.get("stream"):
+                        sent_response = self._proxy_streaming_response(
+                            response,
+                            prepared.original_model,
+                            prepared.payload["messages"],
+                            prepared.cache_namespace,
+                            prepared.recovery_notice,
+                            trace=trace,
+                            record_response_scope=prepared.record_response_scope,
+                            record_response_messages=prepared.record_response_messages,
+                            record_response_contexts=prepared.record_response_contexts,
+                            lineage=prepared.lineage,
+                            root=prepared.root,
+                        )
+                    else:
+                        sent_response = self._proxy_regular_response(
+                            response,
+                            prepared.original_model,
+                            prepared.payload["messages"],
+                            prepared.cache_namespace,
+                            prepared.recovery_notice,
+                            trace=trace,
+                            record_response_scope=prepared.record_response_scope,
+                            record_response_messages=prepared.record_response_messages,
+                            record_response_contexts=prepared.record_response_contexts,
+                            lineage=prepared.lineage,
+                            root=prepared.root,
+                        )
+                    if not sent_response.sent:
+                        spinner.stop()
+                        self._finish_trace(
+                            trace,
+                            "client_disconnected",
+                            http_status=upstream_status,
+                            stream=bool(prepared.payload.get("stream")),
+                        )
+                        return
                     spinner.stop()
+                    log_stats_summary(sent_response.usage)
                     self._finish_trace(
                         trace,
-                        "client_disconnected",
+                        "completed",
                         http_status=upstream_status,
                         stream=bool(prepared.payload.get("stream")),
                     )
-                    return
+            finally:
                 spinner.stop()
-                log_stats_summary(sent_response.usage)
-                self._finish_trace(
-                    trace,
-                    "completed",
-                    http_status=upstream_status,
-                    stream=bool(prepared.payload.get("stream")),
-                )
         finally:
-            spinner.stop()
+            self.reasoning_store.release(prepared.root)
 
     def _start_trace(self, request_path: str) -> TraceRequest | None:
         writer = self.trace_writer
@@ -615,6 +627,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         record_response_scope: str | None = None,
         record_response_messages: list[dict[str, Any]] | None = None,
         record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> ProxyResponseResult:
         body = read_response_body(response)
         upstream_body = body
@@ -632,6 +646,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 recording_contexts=record_response_contexts,
                 display_reasoning=self.config.display_reasoning,
                 collapsible_reasoning=self.config.collapsible_reasoning,
+                lineage=lineage,
+                root=root,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -686,6 +702,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         record_response_scope: str | None = None,
         record_response_messages: list[dict[str, Any]] | None = None,
         record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> ProxyResponseResult:
         if trace is not None:
             trace.record_upstream_response(
@@ -767,6 +785,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         display_adapter,
                         pending_recovery_notice,
                         trace,
+                        lineage,
+                        root,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -803,6 +823,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             ctx_scope,
                             cache_namespace,
                             prior_messages,
+                            lineage,
+                            root,
                         )
                         for ctx_scope, prior_messages in response_contexts
                     )
@@ -859,6 +881,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         display_adapter: CursorReasoningDisplayAdapter | None,
         recovery_notice: str | None = None,
         trace: TraceRequest | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         stripped = line.strip()
         if not stripped.startswith(b"data:"):
@@ -874,6 +898,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     scope,
                     cache_namespace,
                     prior_messages,
+                    lineage,
+                    root,
                 )
                 for scope, prior_messages in response_contexts
             )
@@ -915,6 +941,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     scope,
                     cache_namespace,
                     prior_messages,
+                    lineage,
+                    root,
                 )
                 for scope, prior_messages in response_contexts
             )

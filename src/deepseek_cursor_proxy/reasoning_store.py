@@ -97,11 +97,66 @@ def canonical_scope_message(message: dict[str, Any]) -> dict[str, Any]:
     return canonical
 
 
-def conversation_scope(messages: list[dict[str, Any]], namespace: str = "") -> str:
+def conversation_scope(
+    messages: list[dict[str, Any]],
+    namespace: str = "",
+    lineage: str = "",
+) -> str:
+    """Hash of one request's messages. Changes when Cursor edits the system prompt.
+
+    ``lineage`` keeps two sub-agents with the same transcript in different slots.
+    """
     scope_messages = [canonical_scope_message(message) for message in messages]
     payload: Any = scope_messages
-    if namespace:
+    if namespace or lineage:
         payload = {"namespace": namespace, "messages": scope_messages}
+        if lineage:
+            payload["lineage"] = lineage
+    return _sha256_json(payload)
+
+
+def agent_root(messages: list[dict[str, Any]], explicit_id: str = "") -> str:
+    """Id that stays constant for every turn of one agent, including sub-agents.
+
+    Uses the first user message plus any explicit conversation id. Later turns
+    and system-prompt edits do not change it, so cleanup can keep the whole chat.
+    """
+    first_user = next(
+        (
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    return conversation_lineage([first_user] if first_user else [], explicit_id)
+
+
+def conversation_lineage(messages: list[dict[str, Any]], explicit_id: str = "") -> str:
+    """Stable id for one Cursor agent, including each sub-agent.
+
+    User text stays put across turns and differs between sub-agents. System
+    text is left out so a mode switch in the same chat still matches. An
+    explicit conversation or agent id separates agents whose prompts match.
+    """
+    user_messages = [
+        {
+            "role": "user",
+            "content": message.get("content") or "",
+            "name": message.get("name"),
+        }
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    if not user_messages:
+        user_messages = [
+            canonical_scope_message(message)
+            for message in messages
+            if isinstance(message, dict) and message.get("role") != "system"
+        ]
+    payload: dict[str, Any] = {"messages": user_messages}
+    if explicit_id:
+        payload["agent"] = explicit_id
     return _sha256_json(payload)
 
 
@@ -149,34 +204,40 @@ def scoped_reasoning_keys(message: dict[str, Any], scope: str) -> list[str]:
     return keys
 
 
+def portable_key_prefix(
+    cache_namespace: str,
+    prior_messages: list[dict[str, Any]],
+    lineage: str = "",
+) -> str:
+    """Cache prefix scoped to one agent lineage and the latest user turn."""
+    if not lineage:
+        lineage = conversation_lineage(prior_messages)
+    turn_signature = turn_context_signature(prior_messages)
+    return (
+        f"namespace:{cache_namespace}:lineage:{lineage}:turn:{turn_signature}:"
+    )
+
+
 def portable_reasoning_keys(
     message: dict[str, Any],
     cache_namespace: str,
     prior_messages: list[dict[str, Any]],
+    lineage: str = "",
 ) -> list[str]:
     if not cache_namespace:
         return []
 
-    turn_signature = turn_context_signature(prior_messages)
-    keys = [
-        f"namespace:{cache_namespace}:turn:{turn_signature}:"
-        f"signature:{message_signature(message)}"
-    ]
+    prefix = portable_key_prefix(cache_namespace, prior_messages, lineage)
+    keys = [f"{prefix}signature:{message_signature(message)}"]
     keys.extend(
-        f"namespace:{cache_namespace}:turn:{turn_signature}:"
-        f"tool_call:{tool_call_id}"
-        for tool_call_id in tool_call_ids(message)
+        f"{prefix}tool_call:{tool_call_id}" for tool_call_id in tool_call_ids(message)
     )
     keys.extend(
-        f"namespace:{cache_namespace}:turn:{turn_signature}:"
-        f"tool_call_signature:{tool_call_signature(tool_call)}"
+        f"{prefix}tool_call_signature:{tool_call_signature(tool_call)}"
         for tool_call in (message.get("tool_calls") or [])
         if isinstance(tool_call, dict)
     )
-    keys.extend(
-        f"namespace:{cache_namespace}:turn:{turn_signature}:" f"tool_name:{tool_name}"
-        for tool_name in tool_call_names(message)
-    )
+    keys.extend(f"{prefix}tool_name:{tool_name}" for tool_name in tool_call_names(message))
     return keys
 
 
@@ -184,8 +245,13 @@ class ReasoningStoreBusy(Exception):
     """Raised when the cache lock is still held after the wait limit."""
 
 
+# How long a chat stays pinned after its last request. Cleanup may remove
+# older, idle conversations, but not one the user or an agent is still using.
+DEFAULT_ACTIVE_HOLD_SECONDS = 6 * 60 * 60
+
+
 class ReasoningStore:
-    """SQLite cache of DeepSeek reasoning_content, safe to share across requests."""
+    """SQLite cache of DeepSeek reasoning_content, partitioned by agent lineage."""
 
     def __init__(
         self,
@@ -195,11 +261,14 @@ class ReasoningStore:
         *,
         busy_timeout_seconds: float = 5.0,
         lock_timeout_seconds: float = 5.0,
+        active_hold_seconds: float = DEFAULT_ACTIVE_HOLD_SECONDS,
     ) -> None:
         self.max_age_seconds = max_age_seconds
         self.max_rows = max_rows
         self._busy_timeout_seconds = busy_timeout_seconds
         self._lock_timeout_seconds = lock_timeout_seconds
+        self._active_hold_seconds = active_hold_seconds
+        self._inflight: dict[str, int] = {}
         if str(reasoning_content_path) == ":memory:":
             self.reasoning_content_path: str | Path = ":memory:"
         else:
@@ -239,7 +308,8 @@ class ReasoningStore:
                 key TEXT PRIMARY KEY,
                 reasoning TEXT NOT NULL,
                 message_json TEXT NOT NULL,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                lineage TEXT
             )
             """
         )
@@ -247,6 +317,29 @@ class ReasoningStore:
             """
             CREATE INDEX IF NOT EXISTS reasoning_cache_created_at_idx
             ON reasoning_cache(created_at)
+            """
+        )
+        self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add per-agent columns to caches created before lineage tracking."""
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(reasoning_cache)")
+        }
+        if "lineage" not in columns:
+            conn.execute("ALTER TABLE reasoning_cache ADD COLUMN lineage TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reasoning_lineage (
+                lineage TEXT PRIMARY KEY,
+                last_seen REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS reasoning_cache_lineage_idx
+            ON reasoning_cache(lineage)
             """
         )
 
@@ -298,9 +391,49 @@ class ReasoningStore:
         if not isinstance(reasoning, str):
             return
         message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
-        self._put_many([(key, reasoning, message_json, time.time())])
+        self._put_many([(key, reasoning, message_json, time.time(), "")])
 
-    def _put_many(self, rows: list[tuple[str, str, str, float]]) -> int:
+    def acquire(self, lineage: str) -> None:
+        """Pin one agent conversation for the lifetime of its HTTP request."""
+        if not lineage:
+            return
+        try:
+            with self._locked():
+                self._inflight[lineage] = self._inflight.get(lineage, 0) + 1
+                self._touch_lineage_locked(lineage)
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_lineage_acquire id=%s lock_timeout", request_id())
+
+    def release(self, lineage: str) -> None:
+        """Unpin a finished request. The chat stays held until the idle window ends."""
+        if not lineage:
+            return
+        try:
+            with self._locked():
+                remaining = self._inflight.get(lineage, 0) - 1
+                if remaining <= 0:
+                    self._inflight.pop(lineage, None)
+                else:
+                    self._inflight[lineage] = remaining
+        except ReasoningStoreBusy:
+            LOG.warning("reasoning_lineage_release id=%s lock_timeout", request_id())
+
+    def _touch_lineage_locked(self, lineage: str) -> None:
+        """Record that this agent conversation was just used."""
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO reasoning_lineage(lineage, last_seen)
+                VALUES (?, ?)
+                ON CONFLICT(lineage) DO UPDATE SET
+                    last_seen = excluded.last_seen
+                """,
+                (lineage, time.time()),
+            )
+        except sqlite3.Error as exc:
+            self._fail_locked("lineage", exc)
+
+    def _put_many(self, rows: list[tuple[str, str, str, float, str]]) -> int:
         """Write many cache keys in one transaction and prune once."""
         if not rows:
             return 0
@@ -311,16 +444,29 @@ class ReasoningStore:
                     self._conn.executemany(
                         """
                         INSERT INTO reasoning_cache(
-                            key, reasoning, message_json, created_at
+                            key, reasoning, message_json, created_at, lineage
                         )
-                        VALUES (?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(key) DO UPDATE SET
                             reasoning = excluded.reasoning,
                             message_json = excluded.message_json,
-                            created_at = excluded.created_at
+                            created_at = excluded.created_at,
+                            lineage = excluded.lineage
                         """,
                         rows,
                     )
+                    seen_at = rows[0][3]
+                    lineages = sorted({row[4] for row in rows if row[4]})
+                    if lineages:
+                        self._conn.executemany(
+                            """
+                            INSERT INTO reasoning_lineage(lineage, last_seen)
+                            VALUES (?, ?)
+                            ON CONFLICT(lineage) DO UPDATE SET
+                                last_seen = excluded.last_seen
+                            """,
+                            [(lineage, seen_at) for lineage in lineages],
+                        )
                     self._prune_locked()
                     self._conn.execute("COMMIT")
                 except sqlite3.Error as exc:
@@ -360,6 +506,8 @@ class ReasoningStore:
         scope: str,
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
+        root: str = "",
     ) -> int:
         if message.get("role") != "assistant":
             return 0
@@ -370,13 +518,23 @@ class ReasoningStore:
         keys = scoped_reasoning_keys(message, scope)
         if prior_messages is not None:
             keys.extend(
-                portable_reasoning_keys(message, cache_namespace, prior_messages)
+                portable_reasoning_keys(
+                    message, cache_namespace, prior_messages, lineage
+                )
             )
         keys = list(dict.fromkeys(keys))
         message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
         created_at = time.time()
+        # Pin the whole agent, not one turn, so a later write cannot evict
+        # reasoning this chat still needs.
+        row_lineage = root or (
+            agent_root(prior_messages) if prior_messages is not None else lineage
+        )
         return self._put_many(
-            [(key, reasoning, message_json, created_at) for key in keys]
+            [
+                (key, reasoning, message_json, created_at, row_lineage)
+                for key in keys
+            ]
         )
 
     def lookup_for_message(
@@ -385,11 +543,14 @@ class ReasoningStore:
         scope: str,
         cache_namespace: str = "",
         prior_messages: list[dict[str, Any]] | None = None,
+        lineage: str = "",
     ) -> str | None:
         keys = scoped_reasoning_keys(message, scope)
         if prior_messages is not None:
             keys.extend(
-                portable_reasoning_keys(message, cache_namespace, prior_messages)
+                portable_reasoning_keys(
+                    message, cache_namespace, prior_messages, lineage
+                )
             )
         for key in keys:
             reasoning = self.get(key)
@@ -403,12 +564,16 @@ class ReasoningStore:
         reasoning: str,
         cache_namespace: str,
         prior_messages: list[dict[str, Any]],
+        lineage: str = "",
+        root: str = "",
     ) -> int:
         if not isinstance(reasoning, str):
             return 0
         keys = list(
             dict.fromkeys(
-                portable_reasoning_keys(message, cache_namespace, prior_messages)
+                portable_reasoning_keys(
+                    message, cache_namespace, prior_messages, lineage
+                )
             )
         )
         if not keys:
@@ -423,8 +588,12 @@ class ReasoningStore:
             message_with_reasoning, ensure_ascii=False, sort_keys=True
         )
         created_at = time.time()
+        row_lineage = root or agent_root(prior_messages)
         return self._put_many(
-            [(key, reasoning, message_json, created_at) for key in keys]
+            [
+                (key, reasoning, message_json, created_at, row_lineage)
+                for key in keys
+            ]
         )
 
     def clear(self) -> int:
@@ -437,6 +606,7 @@ class ReasoningStore:
                     ).fetchone()
                     count = int(row[0] if row else 0)
                     self._conn.execute("DELETE FROM reasoning_cache")
+                    self._conn.execute("DELETE FROM reasoning_lineage")
                     self._conn.execute("COMMIT")
                     return count
                 except sqlite3.Error as exc:
@@ -461,19 +631,38 @@ class ReasoningStore:
             LOG.warning("reasoning_cache_prune id=%s lock_timeout", request_id())
             return 0
 
-    def _prune_locked(self) -> int:
-        """Drop expired rows, and overflow rows only when the table is over the cap.
+    def _deletable_predicate(self, now: float) -> tuple[str, list[Any]]:
+        """SQL fragment for rows that are not part of a live or recent chat."""
+        protected: list[str] = []
+        params: list[Any] = []
+        if self._active_hold_seconds > 0:
+            protected.append(
+                "lineage IN (SELECT lineage FROM reasoning_lineage WHERE last_seen >= ?)"
+            )
+            params.append(now - self._active_hold_seconds)
+        inflight = [lineage for lineage in self._inflight if lineage]
+        if inflight:
+            protected.append(f"lineage IN ({','.join('?' for _ in inflight)})")
+            params.extend(inflight)
+        if not protected:
+            return "1", []
+        joined = " OR ".join(protected)
+        return f"NOT (COALESCE(lineage, '') != '' AND ({joined}))", params
 
-        The old ``DELETE ... NOT IN (SELECT ... LIMIT)`` sorted the whole table
-        on every write while holding the process-wide lock. On a warm cache that
-        stalled every later Cursor request before it reached DeepSeek.
+    def _prune_locked(self) -> int:
+        """Drop expired idle rows, then oldest idle rows past the row cap.
+
+        Rows for an in-flight agent, or a chat touched inside the hold window,
+        are left in place even when that keeps the table over the cap.
         """
         deleted = 0
+        now = time.time()
+        eligible_sql, eligible_params = self._deletable_predicate(now)
         if self.max_age_seconds is not None and self.max_age_seconds > 0:
-            cutoff = time.time() - self.max_age_seconds
+            cutoff = now - self.max_age_seconds
             cursor = self._conn.execute(
-                "DELETE FROM reasoning_cache WHERE created_at < ?",
-                (cutoff,),
+                f"DELETE FROM reasoning_cache WHERE created_at < ? AND ({eligible_sql})",
+                (cutoff, *eligible_params),
             )
             try:
                 deleted += cursor.rowcount if cursor.rowcount != -1 else 0
@@ -481,6 +670,8 @@ class ReasoningStore:
                 cursor.close()
 
         if self.max_rows is None or self.max_rows <= 0:
+            if deleted:
+                self._drop_empty_lineages_locked()
             return deleted
 
         cursor = self._conn.execute(
@@ -498,19 +689,61 @@ class ReasoningStore:
         if not over_cap:
             return deleted
 
+        count_row = self._conn.execute("SELECT COUNT(*) FROM reasoning_cache").fetchone()
+        overflow = int(count_row[0] if count_row else 0) - self.max_rows
+        if overflow <= 0:
+            return deleted
+
         cursor = self._conn.execute(
-            """
+            f"""
             DELETE FROM reasoning_cache
             WHERE rowid IN (
                 SELECT rowid FROM reasoning_cache
+                WHERE {eligible_sql}
                 ORDER BY created_at ASC
-                LIMIT (SELECT COUNT(*) - ? FROM reasoning_cache)
+                LIMIT ?
             )
             """,
-            (self.max_rows,),
+            (*eligible_params, overflow),
         )
         try:
-            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            removed = cursor.rowcount if cursor.rowcount != -1 else 0
         finally:
             cursor.close()
+        deleted += removed
+        if removed == 0:
+            LOG.info(
+                "reasoning_cache_prune id=%s kept_active_overflow=%s",
+                request_id(),
+                overflow,
+            )
+        elif removed:
+            LOG.info(
+                "reasoning_cache_prune id=%s deleted=%s",
+                request_id(),
+                removed,
+            )
+        self._drop_empty_lineages_locked()
         return deleted
+
+    def _drop_empty_lineages_locked(self) -> None:
+        """Forget lineage pins that no longer have cached reasoning."""
+        inflight = [lineage for lineage in self._inflight if lineage]
+        if inflight:
+            placeholders = ",".join("?" for _ in inflight)
+            extra = f"AND lineage NOT IN ({placeholders})"
+            params: tuple[Any, ...] = tuple(inflight)
+        else:
+            extra = ""
+            params = ()
+        self._conn.execute(
+            f"""
+            DELETE FROM reasoning_lineage
+            WHERE lineage NOT IN (
+                SELECT lineage FROM reasoning_cache
+                WHERE lineage IS NOT NULL AND lineage != ''
+            )
+            {extra}
+            """,
+            params,
+        )
