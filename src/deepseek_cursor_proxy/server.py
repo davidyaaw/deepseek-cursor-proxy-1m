@@ -55,6 +55,26 @@ class DeepSeekProxyServer(ThreadingHTTPServer):
     trace_writer: TraceWriter | None
 
 
+def model_catalog(model_ids: list[str], created: int) -> dict[str, Any]:
+    """OpenAI model list. api_types tells Cursor this endpoint accepts reasoning_effort."""
+    models = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": "deepseek",
+            "api_types": ["chat_completions"],
+            "capabilities": {
+                "context_length": 1_000_000,
+                "supports_reasoning": True,
+                "reasoning_effort": ["low", "medium", "high", "xhigh", "max"],
+            },
+        }
+        for model_id in model_ids
+    ]
+    return {"object": "list", "data": models}
+
+
 class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     server_version = "DeepSeekPythonProxy/0.1"
 
@@ -170,8 +190,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_json("cursor request body", payload)
 
-        log_cursor_request(payload, self.config)
-
         prepared = prepare_upstream_request(
             payload,
             self.config,
@@ -179,6 +197,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             authorization=cursor_authorization,
             headers=self.headers,
         )
+        log_cursor_request(payload, prepared)
         self.reasoning_store.acquire(prepared.root)
         try:
             if trace is not None:
@@ -509,20 +528,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 [
                     self.config.upstream_model,
                     "deepseek-v4-pro",
+                    "deepseek-flash",
                     "deepseek-v4-flash",
                 ]
             )
         )
-        models = [
-            {
-                "id": model_id,
-                "object": "model",
-                "created": created,
-                "owned_by": "deepseek",
-            }
-            for model_id in model_ids
-        ]
-        self._send_json(200, {"object": "list", "data": models})
+        self._send_json(200, model_catalog(model_ids, created))
 
     def _read_json_body(self) -> dict[str, Any]:
         try:
@@ -1144,13 +1155,17 @@ def usage_from_body(body: bytes) -> dict[str, Any] | None:
 
 def log_cursor_request(
     payload: dict[str, Any],
-    config: ProxyConfig,
+    prepared: Any,
 ) -> None:
-    model = str(payload.get("model") or config.upstream_model)
+    """Log the Cursor model name and the DeepSeek effort actually sent."""
+    effort = prepared.payload.get("reasoning_effort") or "none"
+    cursor_effort = getattr(prepared, "cursor_effort", None)
+    if isinstance(cursor_effort, str) and cursor_effort.lower() != str(effort).lower():
+        effort = f"{effort} cursor={cursor_effort}"
     LOG.info(
         "┌ request model=%s effort=%s messages=%s",
-        model,
-        config.reasoning_effort,
+        prepared.original_model,
+        effort,
         format_count(message_count(payload)),
     )
 

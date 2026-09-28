@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "python .cursor/hooks/cursor_effort.py"
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "python .cursor/hooks/cursor_effort.py"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "python .cursor/hooks/cursor_effort.py"
+      }
+    ]
+  }
+}

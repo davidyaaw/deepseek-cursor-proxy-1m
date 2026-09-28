@@ -110,9 +110,20 @@ function Show-Banner {
     Write-Host "   $Url" -ForegroundColor Yellow
     Write-Host ''
     Write-Host '   Paste into: Settings -> Models -> API Keys -> Override OpenAI Base URL' -ForegroundColor Gray
-    Write-Host '   For 1M context: select GPT-5.6 Sol (or your deepseek-flash)' -ForegroundColor Gray
-    Write-Host '   Model names:   GPT-5.6 Sol  |  deepseek-flash' -ForegroundColor Gray
-    Write-Host '   Composer and Grok keep working with the OpenAI key on.' -ForegroundColor Gray
+    Write-Host '   OpenAI API Key: your DeepSeek key' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '   Cursor model        DeepSeek' -ForegroundColor Gray
+    Write-Host '   GPT-5.6 Sol      -> deepseek-v4-pro' -ForegroundColor White
+    Write-Host '   GPT-5.6 Terra    -> deepseek-flash' -ForegroundColor White
+    Write-Host '   deepseek-*       -> same name' -ForegroundColor White
+    Write-Host '   any other name   -> model in config.yaml' -ForegroundColor White
+    Write-Host '   Effort on these models is sent as DeepSeek reasoning_effort.' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '   OpenAI key stays on:' -ForegroundColor Gray
+    Write-Host '   Composer, Grok      Cursor plan' -ForegroundColor White
+    Write-Host '   Claude, Gemini      Cursor plan (this key is not used)' -ForegroundColor White
+    Write-Host '   Sol, Terra, deepseek-*   this proxy' -ForegroundColor White
+    Write-Host '   Other Cursor models still fail while the key is on.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   ------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host '   Keep this window open while working in Cursor.' -ForegroundColor DarkGray

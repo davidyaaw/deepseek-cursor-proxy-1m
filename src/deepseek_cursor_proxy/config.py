@@ -10,6 +10,7 @@ import yaml
 APP_DIR_NAME = ".deepseek-cursor-proxy"
 CONFIG_FILE_NAME = "config.yaml"
 REASONING_CONTENT_FILE_NAME = "reasoning_content.sqlite3"
+CURSOR_EFFORT_FILE_NAME = "cursor-effort.json"
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 FALSE_VALUES = {"0", "false", "no", "off"}
@@ -38,8 +39,9 @@ DEFAULT_CONFIG_HEADER = (
 DEFAULT_CONFIG_TEXT = f"""{DEFAULT_CONFIG_HEADER}
 # API keys are read from Cursor's Authorization header and forwarded upstream.
 
-# `model` is the fallback when a request has no model; Cursor's requested
-# DeepSeek model name is otherwise respected.
+# `model` is the fallback when a request has no model. Names starting with
+# deepseek- are forwarded as-is. GPT-5.6 Sol → deepseek-v4-pro, Terra →
+# deepseek-flash. Cursor Effort is mapped to DeepSeek reasoning_effort.
 base_url: {DEFAULT_UPSTREAM_BASE_URL}
 model: {DEFAULT_UPSTREAM_MODEL}
 thinking: {DEFAULT_THINKING}
@@ -72,6 +74,11 @@ def default_config_path() -> Path:
 
 def default_reasoning_content_path() -> Path:
     return default_app_dir() / REASONING_CONTENT_FILE_NAME
+
+
+def default_cursor_effort_path() -> Path:
+    """Live Cursor Effort map, written on each send and read by the proxy."""
+    return default_app_dir() / CURSOR_EFFORT_FILE_NAME
 
 
 def populate_default_config_file(config_path: Path) -> None:
@@ -212,6 +219,7 @@ class ProxyConfig:
     ngrok: bool = DEFAULT_NGROK
     ngrok_url: str | None = None
     trace_dir: Path | None = None
+    cursor_effort_path: Path = field(default_factory=default_cursor_effort_path)
 
     @classmethod
     def from_file(

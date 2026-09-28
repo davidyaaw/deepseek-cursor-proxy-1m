@@ -14,17 +14,17 @@
 # DeepSeek API base URL. The proxy appends /chat/completions.
 base_url: https://api.deepseek.com
 
-# Fallback model, and the rewrite target for any non-DeepSeek model id. Cursor's
-# requested DeepSeek model name is forwarded as-is; a name that does NOT start
-# with "deepseek-" (for example the Cursor built-in "GPT-5.6 Sol", which Cursor
-# gives a 1M context window) is rewritten to this model. Point Cursor at a 1M
-# catalog model and you get a 1M window backed by DeepSeek.
+# Fallback model for unknown (non-DeepSeek, non-Sol/Terra) ids.
+# GPT-5.6 Sol → deepseek-v4-pro, GPT-5.6 Terra → deepseek-flash.
+# Names that start with deepseek- are forwarded as-is.
 model: deepseek-flash
 
 # DeepSeek thinking mode: enabled | disabled
 thinking: enabled
 
-# Reasoning effort: low | medium | high | max | xhigh
+# Fallback when Cursor has not reported an Effort yet.
+# The Cursor hook overwrites this with the picker value (low | medium | high | max | xhigh).
+# DeepSeek receives low | high | max (medium → high, xhigh → max).
 reasoning_effort: max
 
 # --- Cursor display ------------------------------------------------------

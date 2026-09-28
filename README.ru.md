@@ -20,7 +20,7 @@ cd deepseek-cursor-proxy-1m
 ./start-deepseek-proxy.sh
 ```
 
-При первом запуске появится `~/.deepseek-cursor-proxy/config.yaml`. Укажите модель, на которую прокси переписывает запросы Cursor:
+При первом запуске появится `~/.deepseek-cursor-proxy/config.yaml`. `model` — запасной вариант для неизвестных имён; Sol и Terra мапятся отдельно:
 
 ```yaml
 model: deepseek-flash
@@ -31,12 +31,25 @@ model: deepseek-flash
 1. **Settings → Models → API Keys**
 2. Включите **Override OpenAI Base URL** и вставьте адрес из лаунчера. В конце обязательно `/v1`.
 3. В **OpenAI API Key** вставьте ключ DeepSeek (`sk-...`).
-4. В выборе модели укажите **GPT-5.6 Sol**. Cursor выделит бюджет 1M, а отвечать будет DeepSeek.
-5. Свой API включается и выключается сочетанием `Ctrl+Shift+0` (Windows/Linux) или `Cmd+Shift+0` (macOS).
+4. Выберите модель из таблицы ниже. Sol и Terra получают бюджет 1M от Cursor, отвечает DeepSeek. **Effort** сохраняется при каждой отправке и уходит в DeepSeek как `reasoning_effort` (Medium → `high`, Extra High → `max`).
+5. Лаунчер сам ставит правку: Composer и Grok работают при включённом ключе OpenAI. Claude и Gemini этот ключ и так не используют. Остальные модели Cursor с включённым ключом по-прежнему не запускаются. На Windows один раз может запросить права администратора. После этого полностью перезапустите Cursor.
 
 <img src="assets/cursor_config.png" width="600" alt="Настройки ключа и Base URL в Cursor">
 
-После первого чата можно выбрать модель `deepseek-flash` или `deepseek-v4-pro`. Имена на `deepseek-` уходят в DeepSeek как есть. Любое другое имя, включая GPT-5.6 Sol, заменяется на `model` из `config.yaml`.
+| Cursor | DeepSeek |
+| --- | --- |
+| GPT-5.6 Sol | `deepseek-v4-pro` |
+| GPT-5.6 Terra | `deepseek-flash` |
+| имя на `deepseek-` | то же имя |
+| любое другое имя | `model` из `config.yaml` |
+
+Две последние строки касаются только запросов через прокси. Composer, Grok, Claude и Gemini сюда не попадают.
+
+Имя на `deepseek-` уходит в DeepSeek как есть: `deepseek-v4-pro` остаётся `deepseek-v4-pro`, `deepseek-flash` остаётся `deepseek-flash`. `config.yaml` для этого менять не нужно.
+
+Любое другое имя, кроме Sol и Terra, прокси отбрасывает и берёт модель из `~/.deepseek-cursor-proxy/config.yaml`, строка `model:`. Сейчас это `deepseek-flash`. Чтобы запасной моделью был Pro, поставьте `model: deepseek-v4-pro` и перезапустите лаунчер.
+
+Для обычной работы достаточно двух пунктов в списке Cursor: **GPT-5.6 Sol** — Pro, **GPT-5.6 Terra** — Flash.
 
 ## Субагенты
 
@@ -48,7 +61,7 @@ Cursor может запустить несколько субагентов с�
 
 - **`reasoning_content` must be passed back** — запрос прошёл мимо прокси. Base URL должен быть адресом ngrok и заканчиваться на `/v1`, окно лаунчера должно быть открыто.
 - **Cursor не принимает localhost** — берите адрес ngrok из лаунчера, не `127.0.0.1`.
-- **Контекст меньше 1M** — один раз выберите **GPT-5.6 Sol**, чтобы Cursor выдал бюджет каталога 1M.
+- **Контекст меньше 1M** — один раз выберите **GPT-5.6 Sol** или **GPT-5.6 Terra**, чтобы Cursor выдал бюджет каталога 1M.
 - **Ошибка провайдера после нескольких субагентов** — прокси сам повторяет оборвавшееся соединение с DeepSeek. Если сборка старая, перезапустите лаунчер и отправьте сообщение ещё раз.
 
 Остальные параметры — в [`config.example.yaml`](config.example.yaml).

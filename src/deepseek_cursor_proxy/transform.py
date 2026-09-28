@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .config import ProxyConfig
+from .cursor_effort import read_cursor_effort
 from .logging import LOG, request_id
 from .reasoning_store import (
     ReasoningStore,
@@ -74,12 +75,25 @@ ROLE_MESSAGE_FIELDS = {
     "tool": {"role", "content", "tool_call_id"},
 }
 
+# Cursor Effort / OpenAI aliases → DeepSeek reasoning_effort.
+# DeepSeek accepts none | low | high | max. medium maps to high;
+# Cursor Extra High (xhigh) is sent as max.
 EFFORT_ALIASES = {
-    "low": "high",
+    "none": "none",
+    "off": "none",
+    "disabled": "none",
+    "minimal": "low",
+    "low": "low",
     "medium": "high",
     "high": "high",
     "max": "max",
     "xhigh": "max",
+}
+
+# Cursor catalog ids that hijack OpenAI BYOK. Strip effort/-fast first.
+CURSOR_MODEL_ALIASES = {
+    "gpt-5.6-sol": "deepseek-v4-pro",
+    "gpt-5.6-terra": "deepseek-flash",
 }
 
 CURSOR_THINKING_BLOCK_RE = re.compile(
@@ -128,12 +142,53 @@ class PreparedRequest:
     lineage: str = ""
     root: str = ""
     agent_id_source: str = "transcript"
+    cursor_effort: str | None = None
 
 
 def normalize_reasoning_effort(value: Any) -> str:
+    """Map a Cursor/OpenAI effort label onto a DeepSeek reasoning_effort value."""
     if not isinstance(value, str):
         return "high"
     return EFFORT_ALIASES.get(value.strip().lower(), "high")
+
+
+def _nonempty_effort(value: Any) -> str | None:
+    """Return a stripped effort string, or None when the field is absent."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def request_reasoning_effort(
+    payload: dict[str, Any],
+    model_suffix_effort: str | None,
+) -> str | None:
+    """Read Cursor Effort from the body, then from the model slug."""
+    effort = _nonempty_effort(payload.get("reasoning_effort"))
+    if effort:
+        return effort
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = _nonempty_effort(reasoning.get("effort"))
+        if effort:
+            return effort
+    return model_suffix_effort
+
+
+def resolve_thinking_effort(
+    requested_effort: str | None,
+    config: ProxyConfig,
+) -> tuple[str, str | None]:
+    """Turn Cursor/config effort into DeepSeek thinking + reasoning_effort."""
+    if requested_effort is None:
+        if config.thinking == "disabled":
+            return "disabled", None
+        return "enabled", normalize_reasoning_effort(config.reasoning_effort)
+
+    normalized = normalize_reasoning_effort(requested_effort)
+    if normalized == "none":
+        return "disabled", None
+    return "enabled", normalized
 
 
 def extract_text_content(content: Any) -> str | None:
@@ -744,6 +799,21 @@ def assistant_needs_reasoning_for_tool_context(
 
 
 _ONE_M_CONTEXT_MARKER = re.compile(r"\[1m\]$", re.IGNORECASE)
+_CURSOR_VARIANT_RE = re.compile(
+    r"(?i)(?:-(none|minimal|low|medium|high|xhigh|max))?(-fast)?$"
+)
+
+
+def split_cursor_model(original_model: str) -> tuple[str, str | None]:
+    """Strip Cursor `[1m]`, Effort, and `-fast` suffixes from a model id."""
+    model = _ONE_M_CONTEXT_MARKER.sub("", original_model.strip())
+    match = _CURSOR_VARIANT_RE.search(model)
+    suffix_effort = None
+    if match and (match.group(1) or match.group(2)):
+        if match.group(1):
+            suffix_effort = match.group(1).lower()
+        model = model[: match.start()]
+    return model, suffix_effort
 
 
 def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
@@ -754,15 +824,21 @@ def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
     # natively, so it is dropped before forwarding upstream. Keeping the
     # normalization here also keeps the reasoning cache namespace identical
     # whether or not the client decorates the model id.
-    model = _ONE_M_CONTEXT_MARKER.sub("", original_model.strip())
-    if model != original_model:
+    # Cursor also appends Effort (`-high`) and `-fast` to GPT-5.6 slugs.
+    unmarked = _ONE_M_CONTEXT_MARKER.sub("", original_model.strip())
+    if unmarked != original_model.strip():
         LOG.info(
             "stripping client-side 1M context marker %r -> %r",
             original_model,
-            model,
+            unmarked,
         )
+    model, _suffix_effort = split_cursor_model(original_model)
     if model.startswith("deepseek-"):
         return model
+    alias = CURSOR_MODEL_ALIASES.get(model.lower())
+    if alias:
+        LOG.info("rewriting Cursor model %r to %r", original_model, alias)
+        return alias
     LOG.warning(
         "rewriting non-DeepSeek model %r to configured fallback %r",
         model,
@@ -826,6 +902,7 @@ _CONSUMED_REQUEST_FIELDS = {
     "agent_id",
     "subagent_id",
     "prompt_cache_key",
+    "reasoning",
 }
 
 _AGENT_HEADER_NAMES = (
@@ -968,13 +1045,22 @@ def prepare_upstream_request(
         if tool_choice is not None:
             prepared["tool_choice"] = tool_choice
 
-    prepared["thinking"] = {"type": config.thinking}
-    thinking_enabled = config.thinking == "enabled"
-    thinking_disabled = config.thinking == "disabled"
-    if thinking_enabled:
-        prepared["reasoning_effort"] = normalize_reasoning_effort(
-            config.reasoning_effort
-        )
+    catalog_model, suffix_effort = split_cursor_model(original_model)
+    cursor_effort = read_cursor_effort(catalog_model, config.cursor_effort_path)
+    requested_effort = request_reasoning_effort(payload, suffix_effort)
+    if requested_effort is None:
+        requested_effort = cursor_effort
+    thinking_type, reasoning_effort = resolve_thinking_effort(
+        requested_effort,
+        config,
+    )
+    prepared["thinking"] = {"type": thinking_type}
+    thinking_enabled = thinking_type == "enabled"
+    thinking_disabled = thinking_type == "disabled"
+    if thinking_enabled and reasoning_effort is not None:
+        prepared["reasoning_effort"] = reasoning_effort
+    else:
+        prepared.pop("reasoning_effort", None)
 
     cache_namespace = reasoning_cache_namespace(
         config,
@@ -1092,6 +1178,7 @@ def prepare_upstream_request(
         lineage=lineage,
         root=root,
         agent_id_source=agent_id_source,
+        cursor_effort=requested_effort,
     )
 
 

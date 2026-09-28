@@ -22,7 +22,7 @@ cd deepseek-cursor-proxy-1m
 ./start-deepseek-proxy.sh
 ```
 
-The first run creates `~/.deepseek-cursor-proxy/config.yaml`. Set the model Cursor should rewrite to:
+The first run creates `~/.deepseek-cursor-proxy/config.yaml`. `model` is only the fallback for unknown names; Sol and Terra have their own mapping:
 
 ```yaml
 model: deepseek-flash
@@ -33,12 +33,25 @@ model: deepseek-flash
 1. **Settings → Models → API Keys**
 2. Turn on **Override OpenAI Base URL** and paste the URL from the launcher. It must end in `/v1`.
 3. Put your DeepSeek key (`sk-...`) in **OpenAI API Key**.
-4. In the model picker choose **GPT-5.6 Sol**. Cursor then budgets 1M tokens. The proxy sends the request to DeepSeek.
-5. Turn the custom API on or off with `Ctrl+Shift+0` (Windows/Linux) or `Cmd+Shift+0` (macOS).
+4. Pick a model from the map below. Sol and Terra get Cursor's 1M budget; the proxy answers with DeepSeek. Cursor **Effort** is saved on each send and forwarded as DeepSeek `reasoning_effort` (Medium becomes `high`, Extra High becomes `max`).
+5. The launcher installs a Cursor fix so Composer and Grok keep working while the OpenAI key stays on. Claude and Gemini already ignore that key. Other Cursor models still fail with it on. Windows may ask for administrator permission once. Quit Cursor and open it again after that.
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor API key and base URL settings">
 
-After the first chat you can also pick a model named `deepseek-flash` or `deepseek-v4-pro`. Names that start with `deepseek-` are forwarded as-is. Any other name, including GPT-5.6 Sol, is rewritten to `model` in `config.yaml`.
+| Cursor | DeepSeek |
+| --- | --- |
+| GPT-5.6 Sol | `deepseek-v4-pro` |
+| GPT-5.6 Terra | `deepseek-flash` |
+| name starting with `deepseek-` | same name |
+| any other name | `model` in `config.yaml` |
+
+The last two rows apply only to requests that go through the proxy. Composer, Grok, Claude, and Gemini do not.
+
+A name that starts with `deepseek-` is sent to DeepSeek unchanged: `deepseek-v4-pro` stays `deepseek-v4-pro`, and `deepseek-flash` stays `deepseek-flash`. You do not edit `config.yaml` for that.
+
+Any other name, besides Sol and Terra, is dropped. The proxy uses the `model:` line in `~/.deepseek-cursor-proxy/config.yaml`. That fallback is `deepseek-flash`. Set `model: deepseek-v4-pro` and restart the launcher when the fallback should be Pro.
+
+For normal use, pick two entries in Cursor: **GPT-5.6 Sol** is Pro, **GPT-5.6 Terra** is Flash.
 
 ## Sub-agents
 
@@ -50,7 +63,7 @@ The proxy keeps that thinking in a local cache because Cursor does not send `rea
 
 - **`reasoning_content` must be passed back** — the request missed the proxy. The Base URL must be the ngrok URL ending in `/v1`, and the launcher window must still be open.
 - **Cursor cannot reach localhost** — use the ngrok URL from the launcher, not `127.0.0.1`.
-- **Context looks smaller than 1M** — select **GPT-5.6 Sol** once so Cursor applies its 1M catalog budget.
+- **Context looks smaller than 1M** — select **GPT-5.6 Sol** or **GPT-5.6 Terra** once so Cursor applies its 1M catalog budget.
 - **Provider error after several sub-agents** — the proxy retries a dropped connection to DeepSeek. Restart the launcher if you are on an older build, then send the message again.
 
 Options and flags are listed in [`config.example.yaml`](config.example.yaml).

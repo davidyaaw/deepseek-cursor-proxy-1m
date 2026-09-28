@@ -9,6 +9,7 @@ recovery-notice stripping, and warning behaviour for dropped fields.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
 import unittest
 
@@ -78,7 +79,9 @@ class ContentHelpersTests(unittest.TestCase):
         self.assertEqual(strip_cursor_thinking_blocks(kept), kept)
 
     def test_normalize_reasoning_effort_aliases(self) -> None:
-        self.assertEqual(normalize_reasoning_effort("low"), "high")
+        self.assertEqual(normalize_reasoning_effort("none"), "none")
+        self.assertEqual(normalize_reasoning_effort("minimal"), "low")
+        self.assertEqual(normalize_reasoning_effort("low"), "low")
         self.assertEqual(normalize_reasoning_effort("medium"), "high")
         self.assertEqual(normalize_reasoning_effort("high"), "high")
         self.assertEqual(normalize_reasoning_effort("max"), "max")
@@ -282,6 +285,155 @@ class RequestPreparationTests(unittest.TestCase):
             )
         self.assertEqual(prepared.payload["model"], "deepseek-v4-pro")
         self.assertIn("non-DeepSeek", "\n".join(captured.output))
+
+    def test_gpt56_sol_rewrites_to_v4_pro(self) -> None:
+        """Cursor GPT-5.6 Sol (and effort suffixes) map to DeepSeek V4 Pro."""
+        for model in (
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-high",
+            "gpt-5.6-sol-xhigh-fast",
+            "gpt-5.6-sol-high[1m]",
+        ):
+            prepared = prepare_upstream_request(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                ProxyConfig(upstream_model="deepseek-flash"),
+                self.store,
+            )
+            self.assertEqual(prepared.payload["model"], "deepseek-v4-pro", model)
+            self.assertEqual(prepared.upstream_model, "deepseek-v4-pro", model)
+
+    def test_gpt56_terra_rewrites_to_flash(self) -> None:
+        """Cursor GPT-5.6 Terra (and effort suffixes) map to DeepSeek Flash."""
+        for model in (
+            "gpt-5.6-terra",
+            "gpt-5.6-terra-high",
+            "gpt-5.6-terra-low-fast",
+        ):
+            prepared = prepare_upstream_request(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                ProxyConfig(upstream_model="deepseek-v4-pro"),
+                self.store,
+            )
+            self.assertEqual(prepared.payload["model"], "deepseek-flash", model)
+            self.assertEqual(prepared.upstream_model, "deepseek-flash", model)
+
+    def test_cursor_effort_suffix_is_forwarded_to_deepseek(self) -> None:
+        """Cursor encodes Effort in the model slug when BYOK drops reasoning_effort."""
+        prepared = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-sol-low",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(reasoning_effort="max"),
+            self.store,
+        )
+        self.assertEqual(prepared.payload["reasoning_effort"], "low")
+        self.assertEqual(prepared.payload["thinking"], {"type": "enabled"})
+
+        extra_high = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-terra-xhigh",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(reasoning_effort="high"),
+            self.store,
+        )
+        self.assertEqual(extra_high.payload["reasoning_effort"], "max")
+        self.assertEqual(extra_high.payload["model"], "deepseek-flash")
+
+    def test_request_reasoning_effort_beats_model_suffix_and_config(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-sol-low",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "high",
+            },
+            ProxyConfig(reasoning_effort="max"),
+            self.store,
+        )
+        self.assertEqual(prepared.payload["reasoning_effort"], "high")
+
+        nested = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-terra",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"effort": "xhigh"},
+            },
+            ProxyConfig(reasoning_effort="low"),
+            self.store,
+        )
+        self.assertEqual(nested.payload["reasoning_effort"], "max")
+        self.assertNotIn("reasoning", nested.payload)
+
+    def test_cursor_none_effort_disables_thinking(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-sol-none",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(thinking="enabled", reasoning_effort="max"),
+            self.store,
+        )
+        self.assertEqual(prepared.payload["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", prepared.payload)
+
+    def test_missing_cursor_effort_falls_back_to_config(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            ProxyConfig(
+                reasoning_effort="max",
+                cursor_effort_path=Path("missing-cursor-effort.json"),
+            ),
+            self.store,
+        )
+        self.assertEqual(prepared.payload["reasoning_effort"], "max")
+
+    def test_saved_cursor_effort_overrides_config(self) -> None:
+        """Cursor's picker is stored beside the config because BYOK omits the field."""
+        from tempfile import TemporaryDirectory
+
+        from deepseek_cursor_proxy.cursor_effort import remember_cursor_effort
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            effort_path = root / "cursor-effort.json"
+            config_path = root / "config.yaml"
+            config_path.write_text("reasoning_effort: high\n", encoding="utf-8")
+            remember_cursor_effort("gpt-5.6-sol", "max", effort_path, config_path)
+            remember_cursor_effort("gpt-5.6-terra", "medium", effort_path, config_path)
+            sol = prepare_upstream_request(
+                {
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                ProxyConfig(reasoning_effort="high", cursor_effort_path=effort_path),
+                self.store,
+            )
+            terra = prepare_upstream_request(
+                {
+                    "model": "gpt-5.6-terra",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                ProxyConfig(reasoning_effort="high", cursor_effort_path=effort_path),
+                self.store,
+            )
+            config_text = config_path.read_text(encoding="utf-8")
+
+        self.assertEqual(sol.payload["model"], "deepseek-v4-pro")
+        self.assertEqual(sol.payload["reasoning_effort"], "max")
+        self.assertEqual(terra.payload["model"], "deepseek-flash")
+        self.assertEqual(terra.payload["reasoning_effort"], "high")
+        self.assertEqual(terra.cursor_effort, "medium")
+        self.assertIn("reasoning_effort: medium", config_text)
 
     def test_client_1m_context_marker_is_stripped_before_upstream(self) -> None:
         # Claude Code / Cherry Studio decorate 1M-capable model ids with a

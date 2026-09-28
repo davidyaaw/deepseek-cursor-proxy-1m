@@ -20,7 +20,7 @@ cd deepseek-cursor-proxy-1m
 ./start-deepseek-proxy.sh
 ```
 
-首次运行会创建 `~/.deepseek-cursor-proxy/config.yaml`。设置 Cursor 请求要改写成的模型：
+首次运行会创建 `~/.deepseek-cursor-proxy/config.yaml`。`model` 只是未知名称的回退；Sol 和 Terra 有各自的映射：
 
 ```yaml
 model: deepseek-flash
@@ -31,12 +31,25 @@ model: deepseek-flash
 1. 打开 **Settings → Models → API Keys**
 2. 启用 **Override OpenAI Base URL**，粘贴启动器给出的地址，必须以 `/v1` 结尾。
 3. 在 **OpenAI API Key** 中填入 DeepSeek 密钥（`sk-...`）。
-4. 在模型选择器里选 **GPT-5.6 Sol**。Cursor 按 1M 分配预算，实际由 DeepSeek 回答。
-5. 用 `Ctrl+Shift+0`（Windows/Linux）或 `Cmd+Shift+0`（macOS）开关自定义 API。
+4. 按下表选择模型。Sol 和 Terra 使用 Cursor 的 1M 预算，实际由 DeepSeek 回答。每次发送时 Cursor 的 **Effort** 会保存并转成 DeepSeek 的 `reasoning_effort`（Medium 变为 `high`，Extra High 变为 `max`）。
+5. 启动器会自动安装修复，这样在开启 OpenAI 密钥时 Composer 和 Grok 仍可使用。Claude 和 Gemini 本来就不使用这把密钥。其他 Cursor 模型在密钥开启时仍然无法使用。Windows 可能询问一次管理员权限。之后请完全退出并重新打开 Cursor。
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor 中的 API 密钥和 Base URL 设置">
 
-第一次对话之后，也可以选择名为 `deepseek-flash` 或 `deepseek-v4-pro` 的模型。以 `deepseek-` 开头的名称会原样转发。其他名称（包括 GPT-5.6 Sol）会改写成 `config.yaml` 里的 `model`。
+| Cursor | DeepSeek |
+| --- | --- |
+| GPT-5.6 Sol | `deepseek-v4-pro` |
+| GPT-5.6 Terra | `deepseek-flash` |
+| 以 `deepseek-` 开头 | 原样转发 |
+| 其他名称 | `config.yaml` 里的 `model` |
+
+最后两行只针对经过代理的请求。Composer、Grok、Claude 和 Gemini 不走这里。
+
+以 `deepseek-` 开头的名称会原样发给 DeepSeek：`deepseek-v4-pro` 仍是 `deepseek-v4-pro`，`deepseek-flash` 仍是 `deepseek-flash`。这种情况不用改 `config.yaml`。
+
+除了 Sol 和 Terra，其他名称会被丢掉。代理改用 `~/.deepseek-cursor-proxy/config.yaml` 里的 `model:`。现在的后备模型是 `deepseek-flash`。若要改成 Pro，写成 `model: deepseek-v4-pro`，然后重启启动器。
+
+平时在 Cursor 里选两项即可：**GPT-5.6 Sol** 是 Pro，**GPT-5.6 Terra** 是 Flash。
 
 ## 子代理
 
@@ -48,7 +61,7 @@ Cursor 可以同时运行多个子代理。每个子代理有自己的对话和�
 
 - **`reasoning_content` must be passed back** — 请求没有经过代理。Base URL 必须是 ngrok 地址且以 `/v1` 结尾，启动器窗口要保持打开。
 - **Cursor 无法访问 localhost** — 使用启动器给出的 ngrok 地址，不要用 `127.0.0.1`。
-- **上下文不到 1M** — 选择一次 **GPT-5.6 Sol**，让 Cursor 套用目录里的 1M 预算。
+- **上下文不到 1M** — 选择一次 **GPT-5.6 Sol** 或 **GPT-5.6 Terra**，让 Cursor 套用目录里的 1M 预算。
 - **多个子代理之后出现 Provider error** — 代理会自动重试中断的 DeepSeek 连接。如果还是旧版本，请重启启动器后再发一次消息。
 
 其余选项见 [`config.example.yaml`](config.example.yaml)。
