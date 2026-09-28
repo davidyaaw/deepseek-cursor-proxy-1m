@@ -85,13 +85,68 @@ function Get-TunnelBaseUrl {
     return $null
 }
 
-# Read the proxy log and return the "api_base_url: ..." value once it appears.
+# Read the proxy logs and return the "api_base_url: ..." value once it appears.
 function Get-BaseUrlFromLog {
-    if (-not (Test-Path $LogFile)) { return $null }
-    $match = Select-String -Path $LogFile -Pattern 'api_base_url:\s*(\S+)' -ErrorAction SilentlyContinue |
-             Select-Object -Last 1
-    if ($match) { return $match.Matches[0].Groups[1].Value.Trim() }
+    foreach ($path in @($ErrFile, $LogFile)) {
+        if (-not (Test-Path $path)) { continue }
+        $match = Select-String -Path $path -Pattern 'api_base_url:\s*(\S+)' -ErrorAction SilentlyContinue |
+                 Select-Object -Last 1
+        if ($match) { return $match.Matches[0].Groups[1].Value.Trim() }
+    }
     return $null
+}
+
+# Stop a process and every child it spawned.
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return }
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    foreach ($child in @($children)) {
+        Stop-ProcessTree -ProcessId ([int]$child.ProcessId)
+    }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+# PID of the process listening on the local proxy port.
+function Get-ProxyListenerPid {
+    foreach ($line in @(netstat -ano -p tcp)) {
+        if ($line -match ':9000\s+.*LISTENING\s+(\d+)') {
+            return [int]$Matches[1]
+        }
+    }
+    return 0
+}
+
+# True when a PowerShell launcher is still an ancestor of this process.
+function Test-LauncherAlive {
+    param([int]$ProcessId)
+    $id = $ProcessId
+    for ($i = 0; $i -lt 8 -and $id -gt 0; $i++) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction SilentlyContinue
+        if (-not $proc) { return $false }
+        if ($proc.Name -match '^(powershell|pwsh)(\.exe)?$') { return $true }
+        $id = [int]$proc.ParentProcessId
+    }
+    return $false
+}
+
+# Windows console ignores ANSI colors until this mode is on.
+function Enable-VirtualTerminal {
+    if (-not ('Win32.ConsoleMode' -as [type])) {
+        Add-Type -Namespace Win32 -Name ConsoleMode -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern System.IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+'@
+    }
+    $handle = [Win32.ConsoleMode]::GetStdHandle(-11)
+    $mode = [uint32]0
+    if ([Win32.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) {
+        [void][Win32.ConsoleMode]::SetConsoleMode($handle, ($mode -bor 4))
+    }
 }
 
 # Print the result banner and copy the Base URL to the clipboard.
@@ -125,6 +180,7 @@ function Show-Banner {
     Write-Host ''
     Write-Host '   ------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host '   Keep this window open while working in Cursor.' -ForegroundColor DarkGray
+    Write-Host '   Commands: / or help, settings, status, clear, quit' -ForegroundColor DarkGray
     Write-Host '   Close it (or press Ctrl+C) to stop the proxy.' -ForegroundColor DarkGray
     Write-Host '   ------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
@@ -142,13 +198,23 @@ if (-not (Test-Path $ProxyDir)) {
 $uv = Get-UvExe
 Install-CursorFix
 
-# Already running? Show the current URL instead of starting a second copy.
+# Already running? Keep this window open. A dead launcher leaves an orphan we replace.
 if (Test-ProxyUp) {
-    $url = Get-TunnelBaseUrl
-    if (-not $url) { $url = Get-BaseUrlFromLog }
-    if ($url) { Show-Banner -Url $url }
-    else { Write-Host '  Proxy is already running but no tunnel URL was found.' -ForegroundColor Yellow }
-    return
+    $listener = Get-ProxyListenerPid
+    if ($listener -and -not (Test-LauncherAlive -ProcessId $listener)) {
+        Write-Host '  Previous proxy window is gone. Starting it again...' -ForegroundColor Yellow
+        Stop-ProcessTree -ProcessId $listener
+        Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
+    } else {
+        $url = Get-TunnelBaseUrl
+        if (-not $url) { $url = Get-BaseUrlFromLog }
+        if ($url) { Show-Banner -Url $url }
+        else { Write-Host '  Proxy is already running but no tunnel URL was found.' -ForegroundColor Yellow }
+        Write-Host '  This window is not running the proxy. Press Enter to close.' -ForegroundColor DarkGray
+        Read-Host | Out-Null
+        return
+    }
 }
 
 $env:PYTHONUNBUFFERED = '1'
@@ -156,17 +222,77 @@ $env:UV_NO_PROGRESS    = '1'
 
 Remove-Item $LogFile, $ErrFile -ErrorAction SilentlyContinue
 
-$proxyArgs = @('run', 'deepseek-cursor-proxy')
-if ($env:DCP_NGROK_URL) { $proxyArgs += @('--ngrok-url', $env:DCP_NGROK_URL) }
+$proxyArgs = 'run deepseek-cursor-proxy'
+if ($env:DCP_NGROK_URL) {
+    $proxyArgs += ' --ngrok-url "' + ($env:DCP_NGROK_URL -replace '"', '\"') + '"'
+}
 
 Write-Host '  Starting DeepSeek proxy + ngrok tunnel...' -ForegroundColor Cyan
 
 # A stale ngrok agent would hold port 4040 and make the new tunnel fail to start.
 Reset-Ngrok
 
-$proc = Start-Process -FilePath $uv -ArgumentList $proxyArgs `
-    -WorkingDirectory $ProxyDir -NoNewWindow -PassThru `
-    -RedirectStandardOutput $LogFile -RedirectStandardError $ErrFile
+# Copy one child stream to a log file and this window.
+# A separate runspace is required: OutputDataReceived callbacks crash this host.
+# One bad console write must not stop the reader: a full pipe freezes the proxy.
+function Start-OutputPump {
+    param($Reader, [string]$Path, [string]$Kind)
+    $pump = [PowerShell]::Create()
+    [void]$pump.AddScript({
+        param($Reader, [string]$Path, [string]$Kind)
+        $esc = [char]27
+        $reset = "$esc[0m"
+        while ($true) {
+            try { $line = $Reader.ReadLine() } catch { break }
+            if ($null -eq $line) { break }
+            try { [IO.File]::AppendAllText($Path, $line + [Environment]::NewLine) } catch { }
+            if ($line.Length -gt 240) { continue }
+            if ($line.Length -gt 0 -and ' {[}"'.IndexOf($line[0]) -ge 0) { continue }
+            try {
+                if ($line.StartsWith('reasoning_cache:')) { $color = '36' }
+                elseif ($Kind -eq 'command') {
+                    if ($line -eq 'verbose: on') { $color = '32' }
+                    elseif ($line -eq 'verbose: off') { $color = '33' }
+                    elseif ($line.StartsWith('unknown')) { $color = '31' }
+                    elseif ($line.StartsWith('cleared')) { $color = '33' }
+                    else { $color = '96' }
+                }
+                elseif ($line -match '^(WARNING|ERROR)') { $color = '33' }
+                elseif ($line.StartsWith('started model')) { $color = '95' }
+                else { $color = '90' }
+                [Console]::Out.WriteLine(('{0}[{1}m{2}{3}' -f $esc, $color, $line, $reset))
+            } catch { }
+        }
+    }).AddArgument($Reader).AddArgument($Path).AddArgument($Kind)
+    $null = $pump.BeginInvoke()
+    return $pump
+}
+
+# Own the child stdin so this window can type settings/clear/quit.
+# Stdout and stderr are echoed here and saved to the log files.
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $uv
+$psi.Arguments = $proxyArgs
+$psi.WorkingDirectory = $ProxyDir
+$psi.UseShellExecute = $false
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.RedirectStandardInput = $true
+$psi.CreateNoWindow = $true
+$psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+$psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+$psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
+$psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+$psi.EnvironmentVariables['UV_NO_PROGRESS'] = '1'
+$psi.EnvironmentVariables['DCP_CONSOLE'] = '1'
+
+$proc = New-Object System.Diagnostics.Process
+$proc.StartInfo = $psi
+try { Enable-VirtualTerminal } catch { }
+[void]$proc.Start()
+$proc.StandardInput.AutoFlush = $true
+$script:stdoutPump = Start-OutputPump -Reader $proc.StandardOutput -Path $LogFile -Kind command
+$script:stderrPump = Start-OutputPump -Reader $proc.StandardError -Path $ErrFile -Kind log
 
 try {
     $url       = $null
@@ -193,9 +319,20 @@ try {
         return
     }
 
-    # Stay alive so the proxy keeps running; the child dies with this window.
-    $proc.WaitForExit()
+    # Stay alive so the proxy keeps running. Lines typed here are commands.
+    while (-not $proc.HasExited) {
+        $esc = [char]27
+        [Console]::Out.Write("$esc[1;32m>$esc[0m ")
+        [Console]::Out.Flush()
+        $line = [Console]::ReadLine()
+        if ($null -eq $line -or $proc.HasExited) { break }
+        $proc.StandardInput.WriteLine($line)
+        if ($line.Trim() -match '^(?i)/?(quit|exit|stop)$') {
+            [void]$proc.WaitForExit(5000)
+            break
+        }
+    }
 } finally {
-    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+    if ($proc -and $proc.Id) { Stop-ProcessTree -ProcessId $proc.Id }
     Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }

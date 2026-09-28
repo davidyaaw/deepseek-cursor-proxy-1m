@@ -32,7 +32,9 @@ class ReasoningStoreTests(unittest.TestCase):
             self.assertIsNone(store.get("a"))
             self.assertEqual(store.get("b"), "reasoning b")
             self.assertEqual(store.get("c"), "reasoning c")
+            self.assertEqual(store.row_count(), 2)
             self.assertEqual(store.clear(), 2)
+            self.assertEqual(store.row_count(), 0)
             self.assertIsNone(store.get("b"))
             self.assertIsNone(store.get("c"))
         finally:

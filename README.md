@@ -14,6 +14,8 @@ Windows. You need [uv](https://docs.astral.sh/uv/), [ngrok](https://ngrok.com/) 
 
 Clone this repo and double-click `Start DeepSeek Proxy.cmd`. Leave the window open. It prints the Base URL and copies it to the clipboard.
 
+In that window type `help`, `settings`, `status`, `clear`, or `quit`. `settings verbose on` turns full logs on without a restart. `clear` deletes the local thinking cache. Closing the window stops the proxy. Starting it again replaces a leftover process from a closed window.
+
 ```bat
 git clone https://github.com/davidyaaw/deepseek-cursor-proxy-1m.git
 cd deepseek-cursor-proxy-1m

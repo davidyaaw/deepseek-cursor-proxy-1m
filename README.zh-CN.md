@@ -12,6 +12,8 @@
 
 克隆本仓库，双击 `Start DeepSeek Proxy.cmd`。窗口保持打开。启动器会打印 Base URL 并复制到剪贴板。
 
+在该窗口输入 `help`、`settings`、`status`、`clear` 或 `quit`。`settings verbose on` 无需重启即可打开完整日志。`clear` 会删除本地 thinking 缓存。关闭窗口即停止代理。再次启动会替换上次关闭窗口后留下的进程。
+
 ```bat
 git clone https://github.com/davidyaaw/deepseek-cursor-proxy-1m.git
 cd deepseek-cursor-proxy-1m

@@ -605,6 +605,18 @@ class ReasoningStore:
             ]
         )
 
+    def row_count(self) -> int:
+        """Return how many reasoning cache rows are stored right now."""
+        try:
+            with self._locked():
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM reasoning_cache"
+                ).fetchone()
+                return int(row[0] if row else 0)
+        except (ReasoningStoreBusy, sqlite3.Error):
+            LOG.warning("reasoning_cache_count id=%s failed", request_id())
+            return -1
+
     def clear(self) -> int:
         try:
             with self._locked():

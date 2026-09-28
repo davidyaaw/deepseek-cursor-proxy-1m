@@ -12,6 +12,8 @@ DeepSeek в Cursor на **Windows**, окно **1 000 000 токенов**. Па
 
 Склонируйте репозиторий и дважды щёлкните `Start DeepSeek Proxy.cmd`. Окно не закрывайте. Лаунчер напечатает Base URL и скопирует его в буфер.
 
+В этом окне можно ввести `help`, `settings`, `status`, `clear` или `quit`. `settings verbose on` включает полные логи без перезапуска. `clear` удаляет локальный кэш thinking. Закрытие окна останавливает прокси. Повторный запуск заменяет процесс, оставшийся от закрытого окна.
+
 ```bat
 git clone https://github.com/davidyaaw/deepseek-cursor-proxy-1m.git
 cd deepseek-cursor-proxy-1m

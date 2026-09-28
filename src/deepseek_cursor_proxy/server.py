@@ -20,6 +20,12 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
+from .console import (
+    ProxyStats,
+    format_cache_rows,
+    format_started_model,
+    start_console,
+)
 from .cursor_cdp_guard import CursorCdpGuard
 from .logging import (
     LOG,
@@ -51,9 +57,12 @@ class ProxyResponseResult:
 
 
 class DeepSeekProxyServer(ThreadingHTTPServer):
+    """HTTP server plus the live config, reasoning cache, and console stats."""
+
     config: ProxyConfig
     reasoning_store: ReasoningStore
     trace_writer: TraceWriter | None
+    stats: ProxyStats
 
 
 def model_catalog(model_ids: list[str], created: int) -> dict[str, Any]:
@@ -199,6 +208,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             headers=self.headers,
         )
         log_cursor_request(payload, prepared)
+        model_line = format_started_model(
+            prepared.original_model,
+            prepared.upstream_model,
+            str(prepared.payload.get("reasoning_effort") or "none"),
+        )
+        note_proxy_request(self.server, model_line)
+        if self.config.verbose:
+            LOG.info("%s", model_line)
         self.reasoning_store.acquire(prepared.root)
         try:
             if trace is not None:
@@ -383,6 +400,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         return
                     spinner.stop()
                     log_stats_summary(sent_response.usage)
+                    LOG.info(
+                        "%s",
+                        format_cache_rows(
+                            self.reasoning_store.row_count(),
+                            self.config.reasoning_cache_max_rows,
+                        ),
+                    )
                     self._finish_trace(
                         trace,
                         "completed",
@@ -1220,6 +1244,13 @@ def usage_from_body(body: bytes) -> dict[str, Any] | None:
     return None
 
 
+def note_proxy_request(server: DeepSeekProxyServer, line: str) -> None:
+    """Remember the latest model line for the status command."""
+    stats = getattr(server, "stats", None)
+    if stats is not None:
+        stats.note(line)
+
+
 def log_cursor_request(
     payload: dict[str, Any],
     prepared: Any,
@@ -1530,6 +1561,7 @@ def main(argv: list[str] | None = None) -> int:
     server.config = config
     server.reasoning_store = store
     server.trace_writer = trace_writer
+    server.stats = ProxyStats()
 
     tunnel: NgrokTunnel | None = None
     public_url: str | None = None
@@ -1554,6 +1586,10 @@ def main(argv: list[str] | None = None) -> int:
         "thinking" if config.thinking == "enabled" else "no thinking",
         config.reasoning_effort,
     )
+    LOG.info(
+        "%s",
+        format_cache_rows(store.row_count(), config.reasoning_cache_max_rows),
+    )
 
     if config.verbose:
         display_reasoning = "off"
@@ -1576,6 +1612,12 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("upstream_url: %s/chat/completions", config.upstream_base_url)
     LOG.info("local_base_url: %s", local_base_url)
     LOG.info("api_base_url: %s", api_base_url)
+    start_console(
+        server,
+        store,
+        api_base_url=api_base_url,
+        local_base_url=local_base_url,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
