@@ -31,7 +31,7 @@ model: deepseek-flash
 2. Turn on **Override OpenAI Base URL** and paste the URL from the launcher. It must end in `/v1`.
 3. Put your DeepSeek key (`sk-...`) in **OpenAI API Key**.
 4. Pick a model and an **Effort** from the tables below. Sol and Terra get Cursor's 1M budget; the proxy answers with DeepSeek.
-5. The launcher patches Cursor so Composer and Grok keep working while the OpenAI key stays on. Claude and Gemini already ignore that key. Other Cursor models still fail with it on. Windows may ask for administrator permission once. Quit Cursor completely and open it again.
+5. The launcher patches Cursor so **Claude, Gemini, Composer, and Grok** stay on your Cursor plan. The DeepSeek key is not sent with them, and they do not go through the proxy. **Sol, Terra, a name starting with `deepseek-`, and any other model** Cursor sends to the OpenAI base URL go through the proxy. An unknown name is not rejected: DeepSeek answers as `model` from the config file. Windows may ask for administrator permission once. Quit Cursor completely and open it again.
 6. Allow the project hook when Cursor asks. It is `.cursor/hooks.json` in this repo and runs only while this folder is the open workspace. Each send stores that model's Effort. If the hook does not run, the proxy uses `reasoning_effort` from the config file.
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor API key and base URL settings">

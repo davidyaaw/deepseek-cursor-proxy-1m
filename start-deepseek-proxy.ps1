@@ -119,11 +119,9 @@ function Show-Banner {
     Write-Host '   any other name   -> model in config.yaml' -ForegroundColor White
     Write-Host '   Effort None disables thinking. Other levels set reasoning_effort.' -ForegroundColor Gray
     Write-Host ''
-    Write-Host '   OpenAI key stays on:' -ForegroundColor Gray
-    Write-Host '   Composer, Grok      Cursor plan' -ForegroundColor White
-    Write-Host '   Claude, Gemini      Cursor plan (this key is not used)' -ForegroundColor White
-    Write-Host '   Sol, Terra, deepseek-*   this proxy' -ForegroundColor White
-    Write-Host '   Other Cursor models still fail while the key is on.' -ForegroundColor Gray
+    Write-Host '   Stay on Cursor:  Claude, Gemini, Composer, Grok' -ForegroundColor White
+    Write-Host '   This proxy:      Sol, Terra, deepseek-*, any other name' -ForegroundColor White
+    Write-Host '   Unknown names are answered by model in config.yaml.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   ------------------------------------------------------------' -ForegroundColor DarkGray
     Write-Host '   Keep this window open while working in Cursor.' -ForegroundColor DarkGray

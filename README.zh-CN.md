@@ -29,7 +29,7 @@ model: deepseek-flash
 2. 启用 **Override OpenAI Base URL**，粘贴启动器给出的地址，必须以 `/v1` 结尾。
 3. 在 **OpenAI API Key** 中填入 DeepSeek 密钥（`sk-...`）。
 4. 按下表选择模型和 **Effort**。Sol 和 Terra 使用 Cursor 的 1M 预算，实际由 DeepSeek 回答。
-5. 启动器会修补 Cursor，这样在开启 OpenAI 密钥时 Composer 和 Grok 仍可使用。Claude 和 Gemini 本来就不使用这把密钥。其他 Cursor 模型在密钥开启时仍然无法使用。Windows 可能询问一次管理员权限。之后请完全退出并重新打开 Cursor。
+5. 启动器会修补 Cursor，使 **Claude、Gemini、Composer 和 Grok** 继续走 Cursor 套餐。DeepSeek 密钥不会随这些模型发送，它们也不经过代理。**Sol、Terra、以 `deepseek-` 开头的名称，以及 Cursor 发到 OpenAI Base URL 的其他模型** 都经过代理。未知名称不会被拒绝：由配置文件里的 `model` 对应的 DeepSeek 回答。Windows 可能询问一次管理员权限。之后请完全退出并重新打开 Cursor。
 6. Cursor 询问时允许项目钩子。它是本仓库里的 `.cursor/hooks.json`，只在这个文件夹作为工作区打开时运行。每次发送会保存该模型的 Effort。如果钩子没有运行，代理使用配置文件里的 `reasoning_effort`。
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor 中的 API 密钥和 Base URL 设置">
