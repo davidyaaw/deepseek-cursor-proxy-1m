@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .config import ProxyConfig
+from .cursor_cdp_guard import sanitize_response_payload
 from .cursor_effort import read_cursor_effort
 from .logging import LOG, request_id
 from .reasoning_store import (
@@ -1249,6 +1250,7 @@ def rewrite_response_body(
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
+        sanitize_response_payload(response_payload)
         if content_prefix:
             prefix_response_content(response_payload, content_prefix)
         record_response_reasoning(

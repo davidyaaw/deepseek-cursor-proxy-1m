@@ -20,6 +20,7 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
+from .cursor_cdp_guard import CursorCdpGuard
 from .logging import (
     LOG,
     TerminalSpinner,
@@ -280,7 +281,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if self.config.verbose:
                 log_send_summary(prepared)
             spinner = TerminalSpinner(
-                enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
+                enabled=bool(prepared.payload.get("stream"))
+                and not self.config.verbose,
                 text="└ {frame}",
             ).start()
 
@@ -773,6 +775,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         finalized = False
         pending_recovery_notice = recovery_notice
         client_open = True
+        cdp_guard = CursorCdpGuard()
         try:
             while client_open:
                 try:
@@ -804,6 +807,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         lineage,
                         root,
                         agent_id,
+                        cdp_guard,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -816,7 +820,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     usage = chunk_usage
                 if trace is not None:
                     trace.record_stream_chunk(line, rewritten)
-                if not self._write_to_client(
+                if rewritten and not self._write_to_client(
                     rewritten, "sending streaming response chunk", flush=True
                 ):
                     client_open = False
@@ -889,6 +893,48 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             flush=True,
         )
 
+    def _prepare_stream_chunk(
+        self,
+        chunk: dict[str, Any],
+        original_model: str,
+        accumulator: StreamAccumulator,
+        cache_namespace: str,
+        response_contexts: list[tuple[str, list[dict[str, Any]]]],
+        display_adapter: CursorReasoningDisplayAdapter | None,
+        recovery_notice: str | None,
+        trace: TraceRequest | None,
+        lineage: str,
+        root: str,
+        agent_id: str,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Record one outbound chunk and mirror reasoning into visible content."""
+        if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
+            recovery_notice = None
+        accumulator.ingest_chunk(chunk)
+        stored = sum(
+            accumulator.store_ready_reasoning(
+                self.reasoning_store,
+                scope,
+                cache_namespace,
+                prior_messages,
+                lineage,
+                root,
+                agent_id,
+            )
+            for scope, prior_messages in response_contexts
+        )
+        if self.config.verbose and stored:
+            LOG.info("stored %s streaming reasoning cache key(s)", stored)
+        chunk_usage = chunk.get("usage")
+        if trace is not None:
+            trace.record_usage(chunk_usage)
+        if display_adapter is not None:
+            display_adapter.rewrite_chunk(chunk)
+        if "model" in chunk:
+            chunk["model"] = original_model
+        usage = chunk_usage if isinstance(chunk_usage, dict) else None
+        return recovery_notice, usage
+
     def _rewrite_sse_line(
         self,
         line: bytes,
@@ -902,6 +948,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         lineage: str = "",
         root: str = "",
         agent_id: str = "",
+        cdp_guard: CursorCdpGuard | None = None,
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         stripped = line.strip()
         if not stripped.startswith(b"data:"):
@@ -909,6 +956,24 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         data = stripped[len(b"data:") :].strip()
         if data == b"[DONE]":
+            prefix = b""
+            if cdp_guard is not None:
+                for flushed in cdp_guard.flush():
+                    flushed["model"] = original_model
+                    recovery_notice, _flushed_usage = self._prepare_stream_chunk(
+                        flushed,
+                        original_model,
+                        accumulator,
+                        cache_namespace,
+                        response_contexts,
+                        display_adapter,
+                        recovery_notice,
+                        trace,
+                        lineage,
+                        root,
+                        agent_id,
+                    )
+                    prefix += sse_data(flushed)
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
             stored = sum(
@@ -930,7 +995,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
             if tool_calls:
                 LOG.info("tool_call_end id=%s count=%s", request_id(), tool_calls)
-            prefix = b""
             if display_adapter is None:
                 if recovery_notice:
                     prefix += sse_data(
@@ -952,43 +1016,36 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
-            if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
-                recovery_notice = None
-            accumulator.ingest_chunk(chunk)
-            stored = sum(
-                accumulator.store_ready_reasoning(
-                    self.reasoning_store,
-                    scope,
+            outgoing = cdp_guard.apply(chunk) if cdp_guard is not None else [chunk]
+            if not outgoing:
+                return b"", False, recovery_notice, None
+            encoded: list[bytes] = []
+            chunk_usage: dict[str, Any] | None = None
+            ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
+            for item in outgoing:
+                recovery_notice, item_usage = self._prepare_stream_chunk(
+                    item,
+                    original_model,
+                    accumulator,
                     cache_namespace,
-                    prior_messages,
+                    response_contexts,
+                    display_adapter,
+                    recovery_notice,
+                    trace,
                     lineage,
                     root,
                     agent_id,
                 )
-                for scope, prior_messages in response_contexts
-            )
-            if self.config.verbose and stored:
-                LOG.info("stored %s streaming reasoning cache key(s)", stored)
-            chunk_usage = chunk.get("usage")
-            if trace is not None:
-                trace.record_usage(chunk_usage)
-            if display_adapter is not None:
-                display_adapter.rewrite_chunk(chunk)
-            if "model" in chunk:
-                chunk["model"] = original_model
-            ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
-            return (
-                (
+                if item_usage is not None:
+                    chunk_usage = item_usage
+                encoded.append(
                     b"data: "
                     + json.dumps(
-                        chunk, ensure_ascii=False, separators=(",", ":")
+                        item, ensure_ascii=False, separators=(",", ":")
                     ).encode("utf-8")
                     + ending
-                ),
-                False,
-                recovery_notice,
-                chunk_usage if isinstance(chunk_usage, dict) else None,
-            )
+                )
+            return b"".join(encoded), False, recovery_notice, chunk_usage
         return line, False, recovery_notice, None
 
 

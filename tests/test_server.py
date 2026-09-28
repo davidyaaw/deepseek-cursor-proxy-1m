@@ -276,6 +276,75 @@ class HandlerStubTests(unittest.TestCase):
         self.assertFalse(result.sent)
         self.assertIn("sending upstream response body", "\n".join(captured.output))
 
+    def test_streaming_response_does_not_forward_page_reload(self) -> None:
+        wfile = BytesIO()
+        handler = _make_handler_stub(wfile, display_reasoning=False)
+        arguments = '{"method":"Page.reload","params":{"ignoreCache":true}}'
+        first = {
+            "id": "stream",
+            "model": "deepseek-flash",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_reload",
+                                "type": "function",
+                                "function": {
+                                    "name": "browser_cdp",
+                                    "arguments": arguments[:24],
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        second = {
+            "id": "stream",
+            "model": "deepseek-flash",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": arguments[24:]},
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        response = _FakeStreamingResponse(
+            [
+                f"data: {json.dumps(first)}\n\n".encode("utf-8"),
+                f"data: {json.dumps(second)}\n\n".encode("utf-8"),
+                b"data: [DONE]\n\n",
+            ]
+        )
+        try:
+            with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
+                result = handler._proxy_streaming_response(
+                    response,
+                    "deepseek-flash",
+                    [{"role": "user", "content": "reload"}],
+                    "ns",
+                )
+        finally:
+            handler.server.reasoning_store.close()
+        body = wfile.getvalue().decode("utf-8")
+        self.assertTrue(result.sent)
+        self.assertNotIn("Page.reload", body)
+        self.assertIn("Runtime.evaluate", body)
+        self.assertIn("call_reload", body)
+        self.assertIn("data: [DONE]", body)
+        self.assertIn("blocked CDP Page.reload", "\n".join(captured.output))
+
     def test_streaming_response_stops_on_client_disconnect(self) -> None:
         handler = _make_handler_stub(_BrokenPipeWfile())
         chunk = {
