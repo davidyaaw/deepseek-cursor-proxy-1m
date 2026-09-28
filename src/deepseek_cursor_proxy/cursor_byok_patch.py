@@ -101,25 +101,14 @@ def update_product_checksum(product_json: str, checksum: str) -> str:
 
 
 def cursor_app_candidates() -> list[Path]:
-    """Paths where Cursor's resources/app directory is usually installed."""
+    """Windows paths where Cursor's resources/app directory is usually installed."""
     candidates: list[Path] = []
     program_files = os.environ.get("ProgramFiles")
     local_app_data = os.environ.get("LOCALAPPDATA")
-    home = Path.home()
     if program_files:
         candidates.append(Path(program_files) / "cursor" / "resources" / "app")
     if local_app_data:
         candidates.append(Path(local_app_data) / "Programs" / "cursor" / "resources" / "app")
-    candidates.extend(
-        [
-            Path("/Applications/Cursor.app/Contents/Resources/app"),
-            home / "Applications/Cursor.app/Contents/Resources/app",
-            Path("/usr/share/cursor/resources/app"),
-            Path("/usr/lib/cursor/resources/app"),
-            Path("/opt/Cursor/resources/app"),
-            home / ".local/share/cursor/resources/app",
-        ]
-    )
     return candidates
 
 

@@ -10,10 +10,7 @@ from pathlib import Path
 
 def _project_python(root: Path) -> Path | None:
     """Prefer the project's 3.10+ interpreter over an older system Python."""
-    candidates = (
-        root / ".venv" / "Scripts" / "python.exe",
-        root / ".venv" / "bin" / "python",
-    )
+    candidates = (root / ".venv" / "Scripts" / "python.exe",)
     for candidate in candidates:
         if candidate.is_file():
             return candidate

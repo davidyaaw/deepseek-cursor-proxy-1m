@@ -117,7 +117,7 @@ function Show-Banner {
     Write-Host '   GPT-5.6 Terra    -> deepseek-flash' -ForegroundColor White
     Write-Host '   deepseek-*       -> same name' -ForegroundColor White
     Write-Host '   any other name   -> model in config.yaml' -ForegroundColor White
-    Write-Host '   Effort on these models is sent as DeepSeek reasoning_effort.' -ForegroundColor Gray
+    Write-Host '   Effort None disables thinking. Other levels set reasoning_effort.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '   OpenAI key stays on:' -ForegroundColor Gray
     Write-Host '   Composer, Grok      Cursor plan' -ForegroundColor White

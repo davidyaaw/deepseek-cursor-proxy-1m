@@ -1,8 +1,8 @@
 # DeepSeek Cursor Proxy - example configuration
 #
 # The proxy generates this file automatically on first run at
-#   ~/.deepseek-cursor-proxy/config.yaml
-# on Windows / macOS / Linux. Copy it there (or point the proxy at it with
+#   %USERPROFILE%\.deepseek-cursor-proxy\config.yaml
+# Copy it there (or point the proxy at it with
 # `--config <path>`) and edit to taste. Every option can also be overridden with
 # a command-line flag.
 #
