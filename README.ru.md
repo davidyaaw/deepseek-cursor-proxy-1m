@@ -58,7 +58,7 @@ model: deepseek-flash
 | Medium, High | thinking включён, `reasoning_effort: high` |
 | Extra High, Max | thinking включён, `reasoning_effort: max` |
 
-**None** — быстрый путь без reasoning-токенов. **High** — обычная работа агента. **Max** — самые трудные задачи. Смена модели или Effort начинает новый thinking. Если у старых вызовов инструментов нет сохранённого reasoning, история остаётся. Если нашлась только часть, старый хвост всё ещё может быть обрезан, и следующий ответ начнётся с `[deepseek-cursor-proxy] Refreshed reasoning_content history.`
+**None** — быстрый путь без reasoning-токенов. **High** — обычная работа агента. **Max** — самые трудные задачи. Смена модели или Effort начинает новый thinking. Ход без сохранённого reasoning остаётся в переписке: он уходит с короткой заглушкой, а ходы из кэша сохраняют настоящий thinking.
 
 ## Инструменты
 

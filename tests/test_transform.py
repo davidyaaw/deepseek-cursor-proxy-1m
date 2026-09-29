@@ -918,6 +918,121 @@ class RequestPreparationTests(unittest.TestCase):
             "Need the file.",
         )
 
+    def test_cached_tool_turn_does_not_drop_later_uncached_tool_turn(self) -> None:
+        """A hit plus a tool-turn miss keeps every message."""
+        first_prior = [{"role": "user", "content": "create the file"}]
+        first_call = {
+            "id": "call_patch",
+            "type": "function",
+            "function": {"name": "ApplyPatch", "arguments": "patch-text"},
+        }
+        second_call = {
+            "id": "call_read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+        namespace = _default_cache_namespace()
+        lineage = conversation_lineage(first_prior)
+        self.store.store_assistant_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Add the file.",
+                "tool_calls": [first_call],
+            },
+            conversation_scope(first_prior, namespace, lineage),
+            namespace,
+            first_prior,
+            lineage=lineage,
+        )
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [
+                    {"type": "custom", "name": "ApplyPatch"},
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {}},
+                    },
+                ],
+                "messages": [
+                    *first_prior,
+                    {"role": "assistant", "content": "", "tool_calls": [first_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "applied",
+                    },
+                    {"role": "assistant", "content": "", "tool_calls": [second_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_read",
+                        "content": "after",
+                    },
+                    {"role": "user", "content": "confirm"},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
+        self.assertIsNone(prepared.recovery_notice)
+        self.assertEqual(
+            [message["role"] for message in prepared.payload["messages"]],
+            ["user", "assistant", "tool", "assistant", "tool", "user"],
+        )
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            "Add the file.",
+        )
+        self.assertEqual(
+            prepared.payload["messages"][3]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+        self.assertEqual(prepared.payload["messages"][5]["content"], "confirm")
+
+    def test_echoed_recovery_notice_does_not_drop_earlier_messages(self) -> None:
+        """An old refresh notice stays in the transcript and is not a cut point."""
+        tool_call = {
+            "id": "call_patch",
+            "type": "function",
+            "function": {"name": "ApplyPatch", "arguments": "patch-text"},
+        }
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [{"type": "custom", "name": "ApplyPatch"}],
+                "messages": [
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "create the file"},
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "applied",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": RECOVERY_NOTICE_CONTENT + "continued",
+                    },
+                    {"role": "user", "content": "confirm"},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
+        self.assertEqual(prepared.retired_prefix_messages, 0)
+        self.assertEqual(
+            [message["role"] for message in prepared.payload["messages"]],
+            ["system", "user", "assistant", "tool", "assistant", "user"],
+        )
+        self.assertEqual(prepared.payload["messages"][4]["content"], "continued")
+        self.assertNotIn(
+            "Refreshed reasoning_content",
+            prepared.payload["messages"][4]["content"],
+        )
+
     def test_uncached_plain_assistant_does_not_drop_uncached_tool_turn(self) -> None:
         tool_call = {
             "id": "call_read",

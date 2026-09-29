@@ -60,7 +60,7 @@ For normal use, pick two entries in Cursor: **GPT-5.6 Sol** is Pro, **GPT-5.6 Te
 | Medium, High | thinking on, `reasoning_effort: high` |
 | Extra High, Max | thinking on, `reasoning_effort: max` |
 
-**None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort starts a new thinking cache. If no old tool turn has saved reasoning, the transcript stays. If only some turns match, the older tail can still be dropped and the next reply can start with `[deepseek-cursor-proxy] Refreshed reasoning_content history.`
+**None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort starts a new thinking cache. A turn with no saved reasoning stays in the transcript: that turn is sent with a short placeholder, and turns still in the cache keep their real thinking.
 
 ## Tools
 

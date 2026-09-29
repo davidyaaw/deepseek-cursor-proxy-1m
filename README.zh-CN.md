@@ -58,7 +58,7 @@ model: deepseek-flash
 | Medium、High | 开启 thinking，`reasoning_effort: high` |
 | Extra High、Max | 开启 thinking，`reasoning_effort: max` |
 
-**None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。切换模型或 Effort 会开始新的 thinking。如果旧的工具回合没有保存过 reasoning，对话会保留。如果只命中一部分，较早的尾部仍可能被丢掉，下一条回复可能以 `[deepseek-cursor-proxy] Refreshed reasoning_content history.` 开头。
+**None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。切换模型或 Effort 会开始新的 thinking。没有保存 reasoning 的回合仍留在对话里：该回合会带一条短占位文本发出，缓存里已有的回合保留真实 thinking。
 
 ## 工具
 

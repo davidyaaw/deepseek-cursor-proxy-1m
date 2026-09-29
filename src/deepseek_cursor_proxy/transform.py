@@ -1414,12 +1414,6 @@ def prepare_upstream_request(
     recovery_dropped_messages = 0
     recovery_notice = None
     recovery_steps: list[dict[str, Any]] = []
-    if thinking_enabled and config.missing_reasoning_strategy == "recover":
-        boundary = active_messages_from_recovery_boundary(pre_repair_messages)
-        if boundary is not None:
-            messages_for_repair, retired_prefix_messages, boundary_step = boundary
-            continued_recovery_boundary = True
-            recovery_steps.append(boundary_step)
 
     request_has_tools = bool(prepared.get("tools"))
     messages, patched_count, missing_indexes, reasoning_diagnostics = (
@@ -1433,14 +1427,16 @@ def prepare_upstream_request(
             require_assistant_reasoning=request_has_tools and thinking_enabled,
         )
     )
-    # Cold cache (every lookup missed): keep the full transcript and fill
-    # placeholders instead of dropping history down to the latest user turn.
+    # Keep the full transcript. A missed turn gets a placeholder DeepSeek
+    # accepts; cached turns keep their real reasoning. Do not drop history.
     if (
         thinking_enabled
         and config.missing_reasoning_strategy == "recover"
         and missing_indexes
-        and patched_count == 0
     ):
+        fill_reason = (
+            "no_prior_reasoning" if patched_count == 0 else "partial_cache"
+        )
         fill_missing_reasoning_placeholders(messages, missing_indexes)
         if store is not None:
             cache_placeholder_reasoning(
@@ -1451,45 +1447,12 @@ def prepare_upstream_request(
                 resolved_agent_id,
             )
         LOG.info(
-            "reasoning_cache_filled id=%s messages=%s reason=no_prior_reasoning",
+            "reasoning_cache_filled id=%s messages=%s reason=%s",
             request_id(),
             len(missing_indexes),
+            fill_reason,
         )
         missing_indexes = []
-    # Mixed hit/miss: recover from a boundary or the latest user message.
-    # A hard cap guarantees a missed cache row cannot spin forever.
-    recovery_passes = 0
-    while (
-        missing_indexes
-        and config.missing_reasoning_strategy == "recover"
-        and recovery_passes < 4
-    ):
-        recovery_passes += 1
-        recovered_messages, dropped_messages, notice, recovery_step = (
-            recover_messages_from_missing_reasoning(messages, missing_indexes)
-        )
-        recovery_steps.append(recovery_step)
-        if not dropped_messages:
-            break
-        recovered_count += len(missing_indexes)
-        recovery_dropped_messages += dropped_messages
-        if notice:
-            recovery_notice = notice
-        (
-            messages,
-            patched_count,
-            missing_indexes,
-            latest_diagnostics,
-        ) = normalize_messages(
-            recovered_messages,
-            store,
-            cache_namespace,
-            repair_reasoning=thinking_enabled,
-            keep_reasoning=not thinking_disabled,
-            agent_id=resolved_agent_id,
-            require_assistant_reasoning=request_has_tools and thinking_enabled,
-        )
-        reasoning_diagnostics.extend(latest_diagnostics)
     active_lineage = conversation_lineage(messages, resolved_agent_id)
     active_record_response_scope = conversation_scope(
         messages, cache_namespace, active_lineage
