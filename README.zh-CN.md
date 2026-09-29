@@ -60,6 +60,10 @@ model: deepseek-flash
 
 **None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。切换模型或 Effort 会开始新的 thinking。如果旧的工具回合没有保存过 reasoning，对话会保留。如果只命中一部分，较早的尾部仍可能被丢掉，下一条回复可能以 `[deepseek-cursor-proxy] Refreshed reasoning_content history.` 开头。
 
+## 工具
+
+Cursor 代理工具（包括 ApplyPatch）会经过代理。DeepSeek 不接受 Cursor 的 custom ApplyPatch 工具，因此代理把它转换成 function 调用，再把补丁文本交回给 Cursor 执行。同一对话的下一次请求会复用已保存的 thinking。
+
 ## 子代理
 
 Cursor 可以同时运行多个子代理。每个子代理有自己的对话和自己的 DeepSeek thinking。一个子代理不会读取或覆盖另一个子代理的推理。

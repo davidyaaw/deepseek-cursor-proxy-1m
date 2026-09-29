@@ -62,6 +62,10 @@ For normal use, pick two entries in Cursor: **GPT-5.6 Sol** is Pro, **GPT-5.6 Te
 
 **None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort starts a new thinking cache. If no old tool turn has saved reasoning, the transcript stays. If only some turns match, the older tail can still be dropped and the next reply can start with `[deepseek-cursor-proxy] Refreshed reasoning_content history.`
 
+## Tools
+
+Cursor agent tools work through the proxy, including ApplyPatch. DeepSeek does not accept Cursor's custom ApplyPatch tool, so the proxy turns it into a function call and sends the patch text back for Cursor to apply. The next request in that chat reuses the saved thinking.
+
 ## Sub-agents
 
 Cursor can run several sub-agents at once. Each one gets its own conversation and its own DeepSeek thinking history. A sub-agent does not read or overwrite another agent's reasoning.
