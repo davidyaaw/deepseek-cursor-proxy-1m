@@ -32,7 +32,7 @@ model: deepseek-flash
 3. 在 **OpenAI API Key** 中填入 DeepSeek 密钥（`sk-...`）。
 4. 按下表选择模型和 **Effort**。Sol 和 Terra 使用 Cursor 的 1M 预算，实际由 DeepSeek 回答。
 5. 启动器会修补 Cursor，使 **Claude、Gemini、Composer 和 Grok** 继续走 Cursor 套餐。DeepSeek 密钥不会随这些模型发送，它们也不经过代理。**Sol、Terra、以 `deepseek-` 开头的名称，以及 Cursor 发到 OpenAI Base URL 的其他模型** 都经过代理。未知名称不会被拒绝：由配置文件里的 `model` 对应的 DeepSeek 回答。Windows 可能询问一次管理员权限。之后请完全退出并重新打开 Cursor。
-6. Cursor 询问时允许项目钩子。它是本仓库里的 `.cursor/hooks.json`，只在这个文件夹作为工作区打开时运行。每次发送会保存该模型的 Effort。如果钩子没有运行，代理使用配置文件里的 `reasoning_effort`。
+6. Cursor 询问时允许用户级 Effort 钩子。启动器会把它装到 `~/.cursor/hooks.json`，因此在任何工作区都会运行，不只限于本仓库。每个模型各自保存自己的 Effort。配置文件里的 `reasoning_effort` 仅在该模型还没有已存 Effort 时作为后备。
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor 中的 API 密钥和 Base URL 设置">
 
@@ -58,7 +58,7 @@ model: deepseek-flash
 | Medium、High | 开启 thinking，`reasoning_effort: high` |
 | Extra High、Max | 开启 thinking，`reasoning_effort: max` |
 
-**None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。在同一对话里切换模型或 Effort 会丢掉之前的 thinking。下一条回复可能以 `[deepseek-cursor-proxy] Refreshed reasoning_content history.` 开头。之后会保留新的 thinking。
+**None** 是快速路径，不产生 reasoning token。**High** 适合日常代理任务。**Max** 留给最难的问题。切换模型或 Effort 会开始新的 thinking。如果旧的工具回合没有保存过 reasoning，对话会保留。如果只命中一部分，较早的尾部仍可能被丢掉，下一条回复可能以 `[deepseek-cursor-proxy] Refreshed reasoning_content history.` 开头。
 
 ## 子代理
 
@@ -71,7 +71,7 @@ Cursor 可以同时运行多个子代理。每个子代理有自己的对话和�
 - **`reasoning_content` must be passed back** — 请求没有经过代理。Base URL 必须是 ngrok 地址且以 `/v1` 结尾，启动器窗口要保持打开。
 - **Cursor 无法访问 localhost** — 使用启动器给出的 ngrok 地址，不要用 `127.0.0.1`。
 - **上下文不到 1M** — 选择一次 **GPT-5.6 Sol** 或 **GPT-5.6 Terra**，让 Cursor 套用目录里的 1M 预算。
-- **Effort 一直是配置文件里的值** — 这个文件夹不是当前工作区，或者没有允许项目钩子。允许 `.cursor/hooks.json` 后再发一次。
+- **Effort 一直是配置文件里的值** — Cursor 询问时允许 `~/.cursor/hooks.json` 里的用户钩子，然后再发一次。启动器会安装这个钩子。
 - **多个子代理之后出现 Provider error** — 代理会自动重试中断的 DeepSeek 连接。如果仍然失败，请重启启动器后再发一次消息。
 
 其余选项见 [`config.example.yaml`](config.example.yaml)。

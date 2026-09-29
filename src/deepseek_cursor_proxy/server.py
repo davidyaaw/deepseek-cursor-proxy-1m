@@ -35,7 +35,11 @@ from .logging import (
     set_request_id,
 )
 from .reasoning_store import ReasoningStore, conversation_scope
-from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
+from .streaming import (
+    ConvertedCustomToolArgsAdapter,
+    CursorReasoningDisplayAdapter,
+    StreamAccumulator,
+)
 from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .upstream import open_upstream
@@ -373,6 +377,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             lineage=prepared.lineage,
                             root=prepared.root,
                             agent_id=prepared.agent_id,
+                            converted_custom_tool_names=prepared.converted_custom_tool_names,
                         )
                     else:
                         sent_response = self._proxy_regular_response(
@@ -388,6 +393,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                             lineage=prepared.lineage,
                             root=prepared.root,
                             agent_id=prepared.agent_id,
+                            converted_custom_tool_names=prepared.converted_custom_tool_names,
                         )
                     if not sent_response.sent:
                         spinner.stop()
@@ -669,6 +675,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         lineage: str = "",
         root: str = "",
         agent_id: str = "",
+        converted_custom_tool_names: frozenset[str] | set[str] | None = None,
     ) -> ProxyResponseResult:
         body = read_response_body(response)
         upstream_body = body
@@ -689,6 +696,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 lineage=lineage,
                 root=root,
                 agent_id=agent_id,
+                converted_custom_tool_names=converted_custom_tool_names,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -746,6 +754,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         lineage: str = "",
         root: str = "",
         agent_id: str = "",
+        converted_custom_tool_names: frozenset[str] | set[str] | None = None,
     ) -> ProxyResponseResult:
         if trace is not None:
             trace.record_upstream_response(
@@ -776,6 +785,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         accumulator = StreamAccumulator()
         usage: dict[str, Any] | None = None
+        converted_args_adapter = ConvertedCustomToolArgsAdapter(
+            converted_custom_tool_names
+        )
         display_adapter = (
             CursorReasoningDisplayAdapter(self.config.collapsible_reasoning)
             if self.config.display_reasoning
@@ -832,6 +844,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         root,
                         agent_id,
                         cdp_guard,
+                        converted_args_adapter,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -930,11 +943,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         lineage: str,
         root: str,
         agent_id: str,
+        converted_args_adapter: ConvertedCustomToolArgsAdapter | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Record one outbound chunk and mirror reasoning into visible content."""
         if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
             recovery_notice = None
         accumulator.ingest_chunk(chunk)
+        if converted_args_adapter is not None:
+            converted_args_adapter.rewrite_chunk(chunk, accumulator)
         stored = sum(
             accumulator.store_ready_reasoning(
                 self.reasoning_store,
@@ -973,6 +989,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         root: str = "",
         agent_id: str = "",
         cdp_guard: CursorCdpGuard | None = None,
+        converted_args_adapter: ConvertedCustomToolArgsAdapter | None = None,
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         stripped = line.strip()
         if not stripped.startswith(b"data:"):
@@ -996,7 +1013,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         lineage,
                         root,
                         agent_id,
+                        converted_args_adapter,
                     )
+                    prefix += sse_data(flushed)
+            if converted_args_adapter is not None:
+                for flushed in converted_args_adapter.flush_chunks(accumulator):
+                    flushed["model"] = original_model
+                    if display_adapter is not None:
+                        display_adapter.rewrite_chunk(flushed)
                     prefix += sse_data(flushed)
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
@@ -1059,6 +1083,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     lineage,
                     root,
                     agent_id,
+                    converted_args_adapter,
                 )
                 if item_usage is not None:
                     chunk_usage = item_usage

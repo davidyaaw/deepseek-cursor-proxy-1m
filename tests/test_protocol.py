@@ -2,10 +2,10 @@
 
 Each test boots the proxy in-process against a small fake upstream and walks
 a real HTTP request scenario. The strict variant rejects with HTTP 400 — the
-same error real DeepSeek emits — whenever an assistant message that
-participated in a tool-calling turn lacks `reasoning_content`. So if the
-proxy is protocol-compliant, every turn succeeds; if not, the upstream
-short-circuits and the test fails fast.
+same error real DeepSeek emits — when a thinking-mode request carries tools
+and an assistant message has no reasoning_content, including a blank string.
+So if the proxy is protocol-compliant, every turn succeeds; if not, the
+upstream short-circuits and the test fails fast.
 
 This file is the ground truth for "does the proxy speak DeepSeek correctly?"
 """
@@ -104,12 +104,17 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
         self.__class__.auth_headers.append(self.headers.get("Authorization", ""))
 
         messages = payload.get("messages") or []
+        tools_present = bool(payload.get("tools"))
         for index, message in enumerate(messages):
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
-            if _is_tool_turn_assistant(messages, index) and not isinstance(
-                message.get("reasoning_content"), str
-            ):
+            # Thinking mode with tools requires reasoning_content on every
+            # assistant turn, including turns that did not call a tool.
+            # A blank string is treated as not passed back.
+            needs_reasoning = tools_present or _is_tool_turn_assistant(
+                messages, index
+            )
+            if needs_reasoning and not _reasoning_passed_back(message):
                 return self._send(
                     400,
                     {
@@ -206,6 +211,12 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+def _reasoning_passed_back(message: dict[str, Any]) -> bool:
+    """True when thinking-mode DeepSeek will accept this assistant turn."""
+    reasoning = message.get("reasoning_content")
+    return isinstance(reasoning, str) and bool(reasoning.strip())
 
 
 def _is_tool_turn_assistant(messages: list[dict[str, Any]], index: int) -> bool:
@@ -543,10 +554,10 @@ class ThinkingDisabledTests(_StrictUpstreamCase):
 
 
 class RecoveryTests(_StrictUpstreamCase):
-    def test_cold_cache_recovers_to_latest_user_with_notice(self) -> None:
-        """Stale tool history with no cached reasoning: proxy keeps only
-        the latest user message + recovery system message and prefixes a
-        user-facing notice into the response."""
+    def test_cold_cache_keeps_full_transcript_with_placeholder(self) -> None:
+        """Stale tool history with no cached reasoning: keep every message and
+        fill placeholder reasoning_content instead of truncating to the latest
+        user turn."""
         status, response = _post(
             f"{self.proxy.url}/v1/chat/completions",
             {
@@ -577,12 +588,17 @@ class RecoveryTests(_StrictUpstreamCase):
         self.assertEqual(status, 200, response)
         sent = StrictFakeDeepSeek.requests[-1]
         self.assertEqual(
-            [m["role"] for m in sent["messages"]], ["system", "system", "user"]
+            [m["role"] for m in sent["messages"]],
+            ["system", "user", "assistant", "tool", "user"],
+        )
+        self.assertEqual(
+            sent["messages"][2]["reasoning_content"],
+            "(prior reasoning unavailable)",
         )
         self.assertEqual(
             sent["messages"][-1]["content"], "Thanks. What about Saturday?"
         )
-        self.assertIn(
+        self.assertNotIn(
             "[deepseek-cursor-proxy] Refreshed reasoning",
             response["choices"][0]["message"]["content"],
         )
@@ -592,60 +608,29 @@ class RecoveryTests(_StrictUpstreamCase):
         recovery notice) back as assistant content, the notice serves as a
         boundary marker for the proxy but must not be replayed upstream as
         if DeepSeek had written it."""
-        # Trigger initial recovery so the response carries the notice.
+        from deepseek_cursor_proxy.transform import RECOVERY_NOTICE_CONTENT
+
         status, first = _post(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
                 "messages": [
-                    {"role": "user", "content": "old work"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": CALL_ID_1,
-                                "type": "function",
-                                "function": {"name": "get_date", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": CALL_ID_1,
-                        "content": "2026-04-24",
-                    },
-                    {"role": "user", "content": "Thanks. What about Saturday?"},
+                    {"role": "user", "content": "Hello"},
                 ],
             },
         )
         self.assertEqual(status, 200)
 
-        # Cursor faithfully echoes the response (including the notice prefix).
+        # Simulate Cursor echoing a prior recovered assistant that still
+        # carries the proxy's refresh notice prefix.
         echoed = _drop_reasoning(first["choices"][0]["message"])
+        echoed["content"] = RECOVERY_NOTICE_CONTENT + (echoed.get("content") or "")
         status, _ = _post(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
                 "messages": [
-                    {"role": "user", "content": "old work"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": CALL_ID_1,
-                                "type": "function",
-                                "function": {"name": "get_date", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": CALL_ID_1,
-                        "content": "2026-04-24",
-                    },
-                    {"role": "user", "content": "Thanks. What about Saturday?"},
+                    {"role": "user", "content": "Hello"},
                     echoed,
                     {"role": "user", "content": "And Sunday?"},
                 ],
@@ -689,10 +674,11 @@ class RecoveryTests(_StrictUpstreamCase):
                 ],
             },
         )
-        # Strict upstream rejects the missing-reasoning history with 400.
-        # The point of this test is the proxy did NOT pre-empt with 409.
+        # Strict upstream used to 400 on missing reasoning; with placeholders
+        # filled the request is protocol-valid and may return 200. Either way
+        # the proxy must not pre-empt with 409 — that is reserved for reject.
         self.assertNotEqual(status, 409)
-        self.assertEqual(status, 400)
+        self.assertIn(status, {200, 400})
         self.assertEqual(len(StrictFakeDeepSeek.requests), 1)
 
 

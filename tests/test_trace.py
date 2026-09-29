@@ -289,8 +289,7 @@ class TraceIntegrationTests(unittest.TestCase):
         )
 
     def test_captures_recovery_diagnostics(self) -> None:
-        """A request that triggers cold-cache recovery records the recovery
-        steps + diagnostic counters in the trace."""
+        """A cold cache keeps the transcript and still records the miss."""
         self._post(
             {
                 "model": "deepseek-v4-pro",
@@ -313,9 +312,7 @@ class TraceIntegrationTests(unittest.TestCase):
             }
         )
         trace = _read_single_trace(self.writer.session_dir)
-        self.assertEqual(
-            trace["transform"]["recovery_steps"][0]["strategy"], "latest_user"
-        )
+        self.assertEqual(trace["transform"]["recovery_steps"], [])
         self.assertGreaterEqual(
             len(
                 [

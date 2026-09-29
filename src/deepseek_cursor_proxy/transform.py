@@ -119,6 +119,17 @@ RECOVERY_SYSTEM_CONTENT = (
     "remaining recovered context."
 )
 
+# DeepSeek rejects tool names outside this pattern (api-docs create-chat-completion).
+DEEPSEEK_FUNCTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+
+# Filled onto assistant tool turns when thinking is on but the cache is cold.
+PRIOR_REASONING_UNAVAILABLE = "(prior reasoning unavailable)"
+
+_CUSTOM_INPUT_INSTRUCTION = (
+    "Put the entire tool input in the `input` string property, using this "
+    "tool's own format — not wrapped in extra JSON."
+)
+
 
 @dataclass(frozen=True)
 class PreparedRequest:
@@ -145,6 +156,7 @@ class PreparedRequest:
     agent_id: str = ""
     agent_id_source: str = "transcript"
     cursor_effort: str | None = None
+    converted_custom_tool_names: frozenset[str] = field(default_factory=frozenset)
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -223,9 +235,59 @@ def strip_cursor_thinking_blocks(content: str) -> str:
     return CURSOR_THINKING_BLOCK_RE.sub("", content).lstrip("\r\n")
 
 
+def cursor_thinking_text(content: str) -> str:
+    """Return thinking text Cursor echoed inside a display block."""
+    details = re.search(
+        r"<summary\b[^>]*>\s*Thinking\s*</summary>\s*([\s\S]*?)\s*</details>",
+        content,
+        re.IGNORECASE,
+    )
+    if details:
+        return details.group(1).strip()
+    tagged = re.search(
+        r"<(?:think|thinking)\b[^>]*>([\s\S]*?)</(?:think|thinking)>",
+        content,
+        re.IGNORECASE,
+    )
+    if tagged:
+        return tagged.group(1).strip()
+    return ""
+
+
+def usable_reasoning_content(value: Any) -> str | None:
+    """Reasoning DeepSeek accepts. Blank strings count as missing."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 def normalize_tool_call(tool_call: Any) -> dict[str, Any]:
+    """Turn one client tool call into a DeepSeek function call.
+
+    Cursor echoes ApplyPatch as ``type: custom``. DeepSeek only accepts
+    ``type: function``, so the free-form ``custom.input`` is wrapped as the
+    JSON string ``{"input": "<raw>"}``.
+    """
     if not isinstance(tool_call, dict):
         tool_call = {}
+    if tool_call.get("type") == "custom":
+        custom = tool_call.get("custom")
+        if not isinstance(custom, dict):
+            custom = {}
+        name = str(custom.get("name") or tool_call.get("name") or "")
+        raw_input = custom.get("input")
+        if not isinstance(raw_input, str):
+            raw_input = "" if raw_input is None else str(raw_input)
+        arguments = json.dumps({"input": raw_input}, ensure_ascii=False)
+        normalized = {
+            "id": str(tool_call.get("id") or ""),
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+        if not normalized["id"]:
+            normalized.pop("id")
+        return normalized
+
     function = tool_call.get("function") or {}
     if not isinstance(function, dict):
         function = {}
@@ -234,9 +296,9 @@ def normalize_tool_call(tool_call: Any) -> dict[str, Any]:
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
 
-    normalized: dict[str, Any] = {
+    normalized = {
         "id": str(tool_call.get("id") or ""),
-        "type": tool_call.get("type") or "function",
+        "type": "function",
         "function": {
             "name": str(function.get("name") or ""),
             "arguments": arguments,
@@ -247,25 +309,73 @@ def normalize_tool_call(tool_call: Any) -> dict[str, Any]:
     return normalized
 
 
-def normalize_tool(tool: Any) -> dict[str, Any] | None:
-    """Return a DeepSeek-compatible function tool, or ``None`` if unsupported.
+def is_valid_deepseek_function_name(name: str) -> bool:
+    """True when a tool name meets DeepSeek's function-name regex."""
+    return bool(DEEPSEEK_FUNCTION_NAME_RE.fullmatch(name))
 
-    DeepSeek only accepts ``{"type": "function", ...}`` entries. OpenAI-format
-    clients also send ``{"type": "custom", ...}`` free-form tools (Cursor does
-    this for GPT-named models), which DeepSeek rejects with
-    ``tools[i].type: unknown variant custom, expected function``.
+
+def _custom_tool_description(original: Any) -> str:
+    """Keep the client description and instruct the model to use ``input``."""
+    base = original.strip() if isinstance(original, str) else ""
+    if base:
+        return f"{base.rstrip()}\n\n{_CUSTOM_INPUT_INSTRUCTION}"
+    return _CUSTOM_INPUT_INSTRUCTION
+
+
+def custom_tool_as_function(tool: dict[str, Any]) -> dict[str, Any] | None:
+    """Map an OpenAI ``custom`` tool onto a DeepSeek ``function`` tool."""
+    name = tool.get("name")
+    if not isinstance(name, str) or not is_valid_deepseek_function_name(name):
+        return None
+    description = _custom_tool_description(tool.get("description"))
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "Entire tool input in this tool's own format, "
+                            "not wrapped in extra JSON."
+                        ),
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def normalize_tool(tool: Any) -> tuple[dict[str, Any] | None, bool]:
+    """Return ``(tool, converted)`` for DeepSeek, or ``(None, False)`` if dropped.
+
+    DeepSeek only accepts ``{"type": "function", ...}``. Cursor's ApplyPatch
+    arrives as OpenAI ``type: "custom"``; those are rewritten to a function
+    tool with a single required string ``input`` property when the name is
+    valid. Other non-function types are still dropped.
     """
     if not isinstance(tool, dict):
-        return None
+        return None, False
     tool_type = tool.get("type") or "function"
+    if tool_type == "custom":
+        converted = custom_tool_as_function(tool)
+        return (converted, True) if converted is not None else (None, False)
     if tool_type != "function":
-        return None
+        return None, False
     function = tool.get("function")
     if not isinstance(function, dict) or not function.get("name"):
-        return None
+        return None, False
+    name = str(function["name"])
+    if not is_valid_deepseek_function_name(name):
+        return None, False
     normalized = dict(tool)
     normalized["type"] = "function"
-    return normalized
+    return normalized, False
 
 
 def tool_label(tool: Any) -> str:
@@ -280,19 +390,24 @@ def tool_label(tool: Any) -> str:
     return f"{tool_type} tool" if tool_type else "unnamed"
 
 
-def normalize_tools(tools: Any) -> tuple[list[dict[str, Any]], list[str]]:
-    """Split client tools into DeepSeek-compatible ones and dropped labels."""
+def normalize_tools(
+    tools: Any,
+) -> tuple[list[dict[str, Any]], list[str], frozenset[str]]:
+    """Split client tools into kept entries, dropped labels, and converted names."""
     kept: list[dict[str, Any]] = []
     dropped: list[str] = []
+    converted: set[str] = set()
     if not isinstance(tools, list):
-        return kept, dropped
+        return kept, dropped, frozenset()
     for tool in tools:
-        normalized = normalize_tool(tool)
+        normalized, was_converted = normalize_tool(tool)
         if normalized is None:
             dropped.append(tool_label(tool))
-        else:
-            kept.append(normalized)
-    return kept, dropped
+            continue
+        kept.append(normalized)
+        if was_converted:
+            converted.add(str(normalized["function"]["name"]))
+    return kept, dropped, frozenset(converted)
 
 
 def tool_names(tools: Any) -> set[str]:
@@ -338,8 +453,172 @@ def normalize_tool_choice(tool_choice: Any) -> Any:
                     "type": "function",
                     "function": {"name": str(function["name"])},
                 }
+        # Cursor forces ApplyPatch with type "custom"; rewrite to function.
+        if tool_choice.get("type") == "custom" and tool_choice.get("name"):
+            name = str(tool_choice["name"])
+            if is_valid_deepseek_function_name(name):
+                return {"type": "function", "function": {"name": name}}
         return None
     return None
+
+
+def unwrap_converted_tool_arguments(arguments: str) -> str:
+    """If arguments are ``{"input": "<raw>"}``, return the raw string."""
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return arguments
+    if (
+        isinstance(parsed, dict)
+        and set(parsed.keys()) == {"input"}
+        and isinstance(parsed["input"], str)
+    ):
+        return parsed["input"]
+    return arguments
+
+
+def present_converted_tool_call(
+    tool_call: dict[str, Any],
+    converted_names: frozenset[str] | set[str],
+) -> None:
+    """Give Cursor the raw patch as a function call it can execute.
+
+    The agent parser accepts only ``type: function`` plus ``function.name``.
+    ApplyPatch then reads that arguments string as the patch itself.
+    """
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return
+    name = function.get("name")
+    if name not in converted_names:
+        return
+    arguments = function.get("arguments")
+    raw_input = (
+        unwrap_converted_tool_arguments(arguments)
+        if isinstance(arguments, str)
+        else ""
+    )
+    function["arguments"] = raw_input
+    tool_call["type"] = "function"
+    tool_call.pop("custom", None)
+
+
+def wrap_converted_history_for_upstream(
+    messages: list[dict[str, Any]],
+    converted_names: frozenset[str] | set[str],
+) -> list[dict[str, Any]]:
+    """Send converted tools upstream as ``{"input": "<raw>"}`` without mutating history."""
+    if not converted_names:
+        return messages
+    wrapped: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            wrapped.append(message)
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            wrapped.append(message)
+            continue
+        updated_calls: list[Any] = []
+        changed = False
+        for tool_call in tool_calls:
+            updated = _wrap_converted_tool_call(tool_call, converted_names)
+            changed = changed or updated is not tool_call
+            updated_calls.append(updated)
+        if not changed:
+            wrapped.append(message)
+            continue
+        copied = dict(message)
+        copied["tool_calls"] = updated_calls
+        wrapped.append(copied)
+    return wrapped
+
+
+def _wrap_converted_tool_call(
+    tool_call: Any,
+    converted_names: frozenset[str] | set[str],
+) -> Any:
+    """Wrap one echoed raw patch so it matches the converted function schema."""
+    if not isinstance(tool_call, dict):
+        return tool_call
+    function = tool_call.get("function")
+    if not isinstance(function, dict) or function.get("name") not in converted_names:
+        return tool_call
+    arguments = function.get("arguments", "")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    raw_input = unwrap_converted_tool_arguments(arguments)
+    wrapped_arguments = json.dumps({"input": raw_input}, ensure_ascii=False)
+    if wrapped_arguments == arguments:
+        return tool_call
+    copied_call = dict(tool_call)
+    copied_function = dict(function)
+    copied_function["arguments"] = wrapped_arguments
+    copied_call["function"] = copied_function
+    return copied_call
+
+
+def unwrap_converted_tool_calls(
+    tool_calls: Any,
+    converted_names: frozenset[str] | set[str],
+) -> None:
+    """Present converted tools as function calls whose arguments are the raw input."""
+    if not converted_names or not isinstance(tool_calls, list):
+        return
+    for tool_call in tool_calls:
+        if isinstance(tool_call, dict):
+            present_converted_tool_call(tool_call, converted_names)
+
+
+def unwrap_converted_tools_in_response(
+    response_payload: dict[str, Any],
+    converted_names: frozenset[str] | set[str],
+) -> None:
+    """Unwrap converted-tool arguments on a non-streaming chat completion."""
+    if not converted_names:
+        return
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict):
+            unwrap_converted_tool_calls(message.get("tool_calls"), converted_names)
+
+
+def fill_missing_reasoning_placeholders(
+    messages: list[dict[str, Any]],
+    missing_indexes: list[int],
+) -> None:
+    """Attach placeholder reasoning when every cache lookup missed."""
+    for index in missing_indexes:
+        messages[index]["reasoning_content"] = PRIOR_REASONING_UNAVAILABLE
+
+
+def cache_placeholder_reasoning(
+    store: ReasoningStore,
+    messages: list[dict[str, Any]],
+    missing_indexes: list[int],
+    cache_namespace: str,
+    agent_id: str = "",
+) -> None:
+    """Persist placeholder reasoning so later turns hit instead of truncating."""
+    root = agent_root(messages, agent_id)
+    for index in missing_indexes:
+        prior = messages[:index]
+        msg_lineage = conversation_lineage(prior, agent_id)
+        scope = conversation_scope(prior, cache_namespace, msg_lineage)
+        store.store_assistant_message(
+            messages[index],
+            scope,
+            cache_namespace,
+            prior,
+            lineage=msg_lineage,
+            root=root,
+            agent_id=agent_id,
+        )
 
 
 def normalize_message(
@@ -350,6 +629,7 @@ def normalize_message(
     repair_reasoning: bool,
     keep_reasoning: bool,
     agent_id: str = "",
+    require_assistant_reasoning: bool = False,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -364,8 +644,16 @@ def normalize_message(
         normalized["content"] = extract_text_content(normalized["content"]) or ""
     elif normalized["role"] in {"assistant", "tool", "system", "user"}:
         normalized["content"] = ""
+    echoed_thinking = ""
     if normalized["role"] == "assistant" and isinstance(normalized.get("content"), str):
+        echoed_thinking = cursor_thinking_text(normalized["content"])
         normalized["content"] = strip_cursor_thinking_blocks(normalized["content"])
+        # Keep the echoed chain of thought. The repair pass strips this
+        # content before it can see the block.
+        if echoed_thinking and usable_reasoning_content(
+            normalized.get("reasoning_content")
+        ) is None:
+            normalized["reasoning_content"] = echoed_thinking
 
     if normalized.get("tool_calls"):
         normalized["tool_calls"] = [
@@ -383,11 +671,17 @@ def normalize_message(
             # User text before this message. Later user messages in the same
             # request belong to a newer turn and must not retarget this lookup.
             lineage = conversation_lineage(prior_messages, agent_id)
-            reasoning = normalized.get("reasoning_content")
-            if not isinstance(reasoning, str):
+            reasoning = usable_reasoning_content(normalized.get("reasoning_content"))
+            if reasoning is None:
                 normalized.pop("reasoning_content", None)
-                needs_reasoning = assistant_needs_reasoning_for_tool_context(
+                # Tool turns always need reasoning. With tools in the request,
+                # DeepSeek also requires it on assistant turns that did not
+                # call a tool.
+                needs_tool_reasoning = assistant_needs_reasoning_for_tool_context(
                     normalized, prior_messages
+                )
+                needs_reasoning = (
+                    needs_tool_reasoning or require_assistant_reasoning
                 )
                 lookup_scope = conversation_scope(
                     prior_messages, cache_namespace, lineage
@@ -407,7 +701,7 @@ def normalize_message(
                 if needs_reasoning and store is not None:
                     for lookup_key in lookup_keys:
                         restored = store.get(str(lookup_key["key"]))
-                        if restored is not None:
+                        if restored is not None and restored.strip():
                             lookup_key["hit"] = True
                             hit_kind = lookup_key["kind"]
                             normalized["reasoning_content"] = restored
@@ -422,12 +716,27 @@ def normalize_message(
                                     agent_root(prior_messages, agent_id),
                                 )
                             break
-                if needs_reasoning and not patched:
+                if needs_reasoning and not patched and echoed_thinking:
+                    normalized["reasoning_content"] = echoed_thinking
+                    hit_kind = "echoed_thinking"
+                elif needs_tool_reasoning and not patched:
                     missing = True
+                elif needs_reasoning and not patched:
+                    # A placeholder keeps the transcript. Do not count it as a
+                    # cache hit: a tool-turn miss in the same request must still
+                    # take the cold-cache path instead of dropping history.
+                    normalized["reasoning_content"] = PRIOR_REASONING_UNAVAILABLE
+                    hit_kind = "placeholder"
                 if needs_reasoning:
+                    if hit_kind == "placeholder":
+                        cache_event = "filled"
+                    elif patched or hit_kind == "echoed_thinking":
+                        cache_event = "hit"
+                    else:
+                        cache_event = "miss"
                     LOG.info(
                         "reasoning_cache_%s id=%s lineage=%s hit_kind=%s",
-                        "hit" if patched else "miss",
+                        cache_event,
                         request_id(),
                         (lineage or "-")[:16],
                         hit_kind or "-",
@@ -580,6 +889,7 @@ def normalize_messages(
     repair_reasoning: bool,
     keep_reasoning: bool,
     agent_id: str = "",
+    require_assistant_reasoning: bool = False,
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
@@ -596,6 +906,7 @@ def normalize_messages(
             repair_reasoning,
             keep_reasoning,
             agent_id,
+            require_assistant_reasoning,
         )
         normalized_messages.append(normalized)
         if patched:
@@ -1012,8 +1323,11 @@ def prepare_upstream_request(
         stream_options["include_usage"] = True
         prepared["stream_options"] = stream_options
 
+    converted_custom_tool_names: frozenset[str] = frozenset()
     if "tools" in prepared and isinstance(prepared["tools"], list):
-        normalized_tools, dropped_tools = normalize_tools(prepared["tools"])
+        normalized_tools, dropped_tools, converted_custom_tool_names = normalize_tools(
+            prepared["tools"]
+        )
         if dropped_tools:
             LOG.warning(
                 "dropping tool(s) DeepSeek cannot accept: %s",
@@ -1035,8 +1349,7 @@ def prepare_upstream_request(
             isinstance(tool_choice, dict)
             and tool_choice["function"]["name"] not in available_tools
         ):
-            # A forced tool that was just dropped (e.g. OpenAI-only `custom`)
-            # can no longer be honored; fall back to the model's own choice.
+            # A forced tool that was just dropped can no longer be honored.
             tool_choice = None
         if tool_choice is None:
             prepared.pop("tool_choice", None)
@@ -1108,6 +1421,7 @@ def prepare_upstream_request(
             continued_recovery_boundary = True
             recovery_steps.append(boundary_step)
 
+    request_has_tools = bool(prepared.get("tools"))
     messages, patched_count, missing_indexes, reasoning_diagnostics = (
         normalize_messages(
             messages_for_repair,
@@ -1116,10 +1430,34 @@ def prepare_upstream_request(
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
             agent_id=resolved_agent_id,
+            require_assistant_reasoning=request_has_tools and thinking_enabled,
         )
     )
-    # One or two passes cover a recovery boundary and then the latest user
-    # message. A hard cap guarantees a missed cache row cannot spin forever.
+    # Cold cache (every lookup missed): keep the full transcript and fill
+    # placeholders instead of dropping history down to the latest user turn.
+    if (
+        thinking_enabled
+        and config.missing_reasoning_strategy == "recover"
+        and missing_indexes
+        and patched_count == 0
+    ):
+        fill_missing_reasoning_placeholders(messages, missing_indexes)
+        if store is not None:
+            cache_placeholder_reasoning(
+                store,
+                messages,
+                missing_indexes,
+                cache_namespace,
+                resolved_agent_id,
+            )
+        LOG.info(
+            "reasoning_cache_filled id=%s messages=%s reason=no_prior_reasoning",
+            request_id(),
+            len(missing_indexes),
+        )
+        missing_indexes = []
+    # Mixed hit/miss: recover from a boundary or the latest user message.
+    # A hard cap guarantees a missed cache row cannot spin forever.
     recovery_passes = 0
     while (
         missing_indexes
@@ -1149,6 +1487,7 @@ def prepare_upstream_request(
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
             agent_id=resolved_agent_id,
+            require_assistant_reasoning=request_has_tools and thinking_enabled,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
     active_lineage = conversation_lineage(messages, resolved_agent_id)
@@ -1159,7 +1498,10 @@ def prepare_upstream_request(
         (record_response_scope, record_response_messages),
         (active_record_response_scope, messages),
     )
-    prepared["messages"] = strip_recovery_notice_for_upstream(messages)
+    prepared["messages"] = wrap_converted_history_for_upstream(
+        strip_recovery_notice_for_upstream(messages),
+        converted_custom_tool_names,
+    )
 
     return PreparedRequest(
         payload=prepared,
@@ -1183,6 +1525,7 @@ def prepare_upstream_request(
         agent_id=resolved_agent_id,
         agent_id_source=agent_id_source,
         cursor_effort=requested_effort,
+        converted_custom_tool_names=converted_custom_tool_names,
     )
 
 
@@ -1247,10 +1590,15 @@ def rewrite_response_body(
     lineage: str = "",
     root: str = "",
     agent_id: str = "",
+    converted_custom_tool_names: frozenset[str] | set[str] | None = None,
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
         sanitize_response_payload(response_payload)
+        unwrap_converted_tools_in_response(
+            response_payload,
+            frozenset(converted_custom_tool_names or ()),
+        )
         if content_prefix:
             prefix_response_content(response_payload, content_prefix)
         record_response_reasoning(

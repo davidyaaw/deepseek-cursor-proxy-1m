@@ -9,6 +9,7 @@ import threading
 from typing import Any, TextIO
 
 from .config import ProxyConfig
+from .cursor_effort import read_cursor_efforts
 from .logging import configure_logging
 from .reasoning_store import ReasoningStore
 from .transform import split_cursor_model
@@ -88,6 +89,15 @@ def format_started_model(original: str, upstream: str, effort: str) -> str:
         shown = f"{cursor_name} → {deepseek_name}"
     shown_effort = effort.strip() or "none"
     return f"started model {shown}, effort {shown_effort}"
+
+
+def format_cursor_effort_line(config: ProxyConfig) -> str:
+    """Show the per-model Cursor Effort map the proxy actually reads."""
+    models = read_cursor_efforts(config.cursor_effort_path)
+    if not models:
+        return "cursor_effort: no Cursor effort stored yet"
+    parts = ", ".join(f"{model}={effort}" for model, effort in sorted(models.items()))
+    return f"cursor_effort: {parts}"
 
 
 def format_cache_rows(current: int, maximum: int) -> str:
@@ -198,6 +208,7 @@ class ProxyConsole:
             f"verbose: {'on' if config.verbose else 'off'}",
             f"thinking: {config.thinking}",
             f"reasoning_effort: {config.reasoning_effort}",
+            format_cursor_effort_line(config),
             f"model: {config.upstream_model}",
             f"display_reasoning: {self._display_reasoning(config)}",
             f"missing_reasoning_strategy: {config.missing_reasoning_strategy}",

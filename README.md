@@ -34,7 +34,7 @@ model: deepseek-flash
 3. Put your DeepSeek key (`sk-...`) in **OpenAI API Key**.
 4. Pick a model and an **Effort** from the tables below. Sol and Terra get Cursor's 1M budget; the proxy answers with DeepSeek.
 5. The launcher patches Cursor so **Claude, Gemini, Composer, and Grok** stay on your Cursor plan. The DeepSeek key is not sent with them, and they do not go through the proxy. **Sol, Terra, a name starting with `deepseek-`, and any other model** Cursor sends to the OpenAI base URL go through the proxy. An unknown name is not rejected: DeepSeek answers as `model` from the config file. Windows may ask for administrator permission once. Quit Cursor completely and open it again.
-6. Allow the project hook when Cursor asks. It is `.cursor/hooks.json` in this repo and runs only while this folder is the open workspace. Each send stores that model's Effort. If the hook does not run, the proxy uses `reasoning_effort` from the config file.
+6. Allow the user-level Effort hook when Cursor asks. The launcher installs it in `~/.cursor/hooks.json`, so it runs in every workspace, not only this repo. Each model keeps its own Effort. The `reasoning_effort` value in the config file is the fallback when that model has no stored Effort.
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor API key and base URL settings">
 
@@ -60,7 +60,7 @@ For normal use, pick two entries in Cursor: **GPT-5.6 Sol** is Pro, **GPT-5.6 Te
 | Medium, High | thinking on, `reasoning_effort: high` |
 | Extra High, Max | thinking on, `reasoning_effort: max` |
 
-**None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort in the same chat drops the previous thinking cache. The next reply can start with `[deepseek-cursor-proxy] Refreshed reasoning_content history.` Later replies keep the new thinking.
+**None** is the fast path: no reasoning tokens. **High** is the normal agent setting. **Max** is for the hardest tasks. Changing model or Effort starts a new thinking cache. If no old tool turn has saved reasoning, the transcript stays. If only some turns match, the older tail can still be dropped and the next reply can start with `[deepseek-cursor-proxy] Refreshed reasoning_content history.`
 
 ## Sub-agents
 
@@ -73,7 +73,7 @@ The proxy keeps that thinking in a local cache because Cursor does not send `rea
 - **`reasoning_content` must be passed back** — the request missed the proxy. The Base URL must be the ngrok URL ending in `/v1`, and the launcher window must still be open.
 - **Cursor cannot reach localhost** — use the ngrok URL from the launcher, not `127.0.0.1`.
 - **Context looks smaller than 1M** — select **GPT-5.6 Sol** or **GPT-5.6 Terra** once so Cursor applies its 1M catalog budget.
-- **Effort stays on the config value** — this folder is not the open workspace, or the project hook was not allowed. Allow `.cursor/hooks.json`, then send again.
+- **Effort stays on the config value** — allow the user hook in `~/.cursor/hooks.json` when Cursor asks, then send again. The launcher installs that hook.
 - **Provider error after several sub-agents** — the proxy retries a dropped connection to DeepSeek. Restart the launcher and send the message again if it still fails.
 
 Options and flags are listed in [`config.example.yaml`](config.example.yaml).

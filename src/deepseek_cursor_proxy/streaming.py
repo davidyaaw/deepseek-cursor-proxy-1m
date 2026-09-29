@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import time
 from typing import Any
 
@@ -358,3 +359,244 @@ def fold_reasoning_into_content(
             + block_end
             + (content if isinstance(content, str) else "")
         )
+
+
+def _unwrap_input_arguments(arguments: str) -> str:
+    """If arguments are ``{"input": "<raw>"}``, return the raw string."""
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return arguments
+    if (
+        isinstance(parsed, dict)
+        and set(parsed.keys()) == {"input"}
+        and isinstance(parsed["input"], str)
+    ):
+        return parsed["input"]
+    return arguments
+
+
+@dataclass
+class _ConvertedToolArgState:
+    """Buffered stream state for one converted custom tool call."""
+
+    name: str = ""
+    arguments: str = ""
+    call_id: str | None = None
+    call_type: str | None = None
+    converted: bool | None = None
+    flushed: bool = False
+
+
+class ConvertedCustomToolArgsAdapter:
+    """Deliver converted tools as function calls with the raw patch text.
+
+    DeepSeek streams ``{"input": "<patch>"}``. Cursor's parser requires
+    ``type: function`` and ``function.name``, and ApplyPatch reads the
+    arguments string as the patch itself.
+    """
+
+    def __init__(self, converted_names: frozenset[str] | set[str] | None = None) -> None:
+        self._converted_names = frozenset(converted_names or ())
+        self._state: dict[tuple[int, int], _ConvertedToolArgState] = {}
+        self._last_chunk_metadata: dict[str, Any] = {}
+
+    def rewrite_chunk(
+        self,
+        chunk: dict[str, Any],
+        accumulator: StreamAccumulator | None = None,
+    ) -> None:
+        """Strip converted-tool arg fragments; emit unwrapped args before finish."""
+        if not self._converted_names:
+            return
+        self._remember_chunk_metadata(chunk)
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return
+        for raw_choice in choices:
+            if not isinstance(raw_choice, dict):
+                continue
+            choice_index = int(raw_choice.get("index") or 0)
+            delta = raw_choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+                raw_choice["delta"] = delta
+            self._filter_tool_call_deltas(choice_index, delta)
+            if raw_choice.get("finish_reason") is not None:
+                flushed = self._flush_choice(choice_index)
+                if flushed:
+                    delta.setdefault("tool_calls", [])
+                    delta["tool_calls"].extend(flushed)
+                if accumulator is not None:
+                    self._unwrap_accumulator_choice(accumulator, choice_index)
+
+    def flush_chunks(self, accumulator: StreamAccumulator | None = None) -> list[dict[str, Any]]:
+        """Emit any still-buffered converted-tool arguments at stream end."""
+        if not self._converted_names:
+            return []
+        by_choice: dict[int, list[dict[str, Any]]] = {}
+        for (choice_index, _tool_index), state in list(self._state.items()):
+            if state.flushed or not state.converted:
+                continue
+            flushed = self._flush_choice(choice_index)
+            if flushed:
+                by_choice.setdefault(choice_index, []).extend(flushed)
+            if accumulator is not None:
+                self._unwrap_accumulator_choice(accumulator, choice_index)
+        chunks: list[dict[str, Any]] = []
+        for choice_index, deltas in sorted(by_choice.items()):
+            chunks.append(
+                {
+                    "id": self._last_chunk_metadata.get(
+                        "id", "chatcmpl-converted-tool-args"
+                    ),
+                    "object": self._last_chunk_metadata.get(
+                        "object", "chat.completion.chunk"
+                    ),
+                    "created": self._last_chunk_metadata.get(
+                        "created", int(time.time())
+                    ),
+                    "choices": [
+                        {
+                            "index": choice_index,
+                            "delta": {"tool_calls": deltas},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        return chunks
+
+    def _filter_tool_call_deltas(self, choice_index: int, delta: dict[str, Any]) -> None:
+        raw_calls = delta.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return
+        kept: list[dict[str, Any]] = []
+        for raw in raw_calls:
+            if not isinstance(raw, dict):
+                continue
+            rewritten = self._consume_tool_call_delta(choice_index, raw)
+            if rewritten is not None:
+                kept.append(rewritten)
+        if kept:
+            delta["tool_calls"] = kept
+        else:
+            delta.pop("tool_calls", None)
+
+    def _consume_tool_call_delta(
+        self,
+        choice_index: int,
+        raw: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool_index = raw.get("index")
+        if not isinstance(tool_index, int):
+            tool_index = 0
+        state = self._state.setdefault(
+            (choice_index, tool_index), _ConvertedToolArgState()
+        )
+        function = raw.get("function")
+        if not isinstance(function, dict):
+            function = {}
+        if function.get("name"):
+            state.name += str(function["name"])
+            state.converted = state.name in self._converted_names
+        if raw.get("id"):
+            state.call_id = str(raw["id"])
+        if raw.get("type"):
+            state.call_type = str(raw["type"])
+        if "arguments" in function and function["arguments"] is not None:
+            state.arguments += str(function["arguments"])
+
+        # Hold converted calls until the JSON arguments can be unwrapped.
+        # Cursor rejects a tool delta that is not type=function with a name.
+        if state.converted is None:
+            return None
+        if state.converted:
+            return None
+
+        # Name resolved to a normal function: forward args (including any held).
+        outbound = dict(raw)
+        if state.call_id and "id" not in outbound:
+            outbound["id"] = state.call_id
+        if state.call_type and "type" not in outbound:
+            outbound["type"] = state.call_type
+        if state.arguments:
+            outbound_fn = dict(function)
+            if state.name and "name" not in outbound_fn:
+                outbound_fn["name"] = state.name
+            outbound_fn["arguments"] = state.arguments
+            outbound["function"] = outbound_fn
+            state.arguments = ""
+            return outbound
+        return outbound
+
+    def _flush_choice(self, choice_index: int) -> list[dict[str, Any]]:
+        """Emit one function delta whose arguments are the raw patch."""
+        released: list[dict[str, Any]] = []
+        for (held_choice, tool_index), state in self._state.items():
+            if held_choice != choice_index or state.flushed:
+                continue
+            if state.converted is not True:
+                continue
+            state.flushed = True
+            released.append(_function_tool_delta(tool_index, state))
+        return released
+
+    def _unwrap_accumulator_choice(
+        self,
+        accumulator: StreamAccumulator,
+        choice_index: int,
+    ) -> None:
+        choice = accumulator.choices.get(choice_index)
+        if choice is None:
+            return
+        for tool_index, tool_call in enumerate(choice.tool_calls):
+            state = self._state.get((choice_index, tool_index))
+            if state is None or state.converted is not True:
+                continue
+            function = tool_call.setdefault(
+                "function", {"name": "", "arguments": ""}
+            )
+            function["arguments"] = _unwrap_input_arguments(
+                state.arguments or str(function.get("arguments") or "")
+            )
+
+    def _remember_chunk_metadata(self, chunk: dict[str, Any]) -> None:
+        metadata = {
+            key: chunk[key] for key in ("id", "object", "created") if key in chunk
+        }
+        if metadata:
+            self._last_chunk_metadata.update(metadata)
+
+
+def _function_tool_delta(
+    tool_index: int,
+    state: _ConvertedToolArgState,
+) -> dict[str, Any]:
+    """One OpenAI tool delta Cursor's agent parser can execute."""
+    delta: dict[str, Any] = {
+        "index": tool_index,
+        "type": "function",
+        "function": {
+            "name": state.name,
+            "arguments": _unwrap_input_arguments(state.arguments),
+        },
+    }
+    if state.call_id:
+        delta["id"] = state.call_id
+    return delta
+
+
+def _tool_call_delta_without_arguments(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy a tool_call delta with function.arguments removed."""
+    outbound = {key: value for key, value in raw.items() if key != "function"}
+    function = raw.get("function")
+    if isinstance(function, dict):
+        outbound_fn = {
+            key: value for key, value in function.items() if key != "arguments"
+        }
+        if outbound_fn:
+            outbound["function"] = outbound_fn
+    if not (outbound.keys() - {"index"}):
+        return None
+    return outbound

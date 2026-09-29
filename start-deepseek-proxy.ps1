@@ -55,6 +55,18 @@ function Install-CursorFix {
     }
 }
 
+# Install a user-level Cursor hook so Effort is saved from every workspace.
+function Install-CursorEffortHook {
+    Write-Host '  Installing user-level Cursor Effort hook...' -ForegroundColor Cyan
+    $env:PYTHONPATH = Join-Path $ProxyDir 'src'
+    & $uv run --no-sync python -m deepseek_cursor_proxy.cursor_effort_install
+    if ($LASTEXITCODE -eq 0) { return }
+    & $uv run python -m deepseek_cursor_proxy.cursor_effort_install
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '  Cursor Effort hook was not installed. Effort may not persist outside this repo.' -ForegroundColor Yellow
+    }
+}
+
 # Tear down leftover ngrok agents so the port 4040 control API is free.
 function Reset-Ngrok {
     Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -197,6 +209,7 @@ if (-not (Test-Path $ProxyDir)) {
 
 $uv = Get-UvExe
 Install-CursorFix
+Install-CursorEffortHook
 
 # Already running? Keep this window open. A dead launcher leaves an orphan we replace.
 if (Test-ProxyUp) {

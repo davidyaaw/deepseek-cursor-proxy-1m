@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from io import StringIO
+import json
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from deepseek_cursor_proxy.config import ProxyConfig
@@ -30,9 +33,16 @@ class _Server:
 
 class ConsoleCommandTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.effort_path = Path(self._temp.name) / "cursor-effort.json"
         self.store = ReasoningStore(":memory:", max_rows=100)
         self.server = _Server(
-            ProxyConfig(verbose=False, reasoning_cache_max_rows=100, thinking="enabled")
+            ProxyConfig(
+                verbose=False,
+                reasoning_cache_max_rows=100,
+                thinking="enabled",
+                cursor_effort_path=self.effort_path,
+            )
         )
         self.stdout = StringIO()
         self.console = ProxyConsole(
@@ -47,6 +57,7 @@ class ConsoleCommandTests(unittest.TestCase):
     def tearDown(self) -> None:
         configure_logging(verbose=False)
         self.store.close()
+        self._temp.cleanup()
 
     def output(self) -> str:
         return self.stdout.getvalue()
@@ -70,6 +81,22 @@ class ConsoleCommandTests(unittest.TestCase):
         self.assertIn("reasoning_cache: 0 / 100 rows", text)
         self.assertIn("settings verbose on|off", text)
         self.assertIn("https://example.ngrok.app/v1", text)
+        self.assertIn("cursor_effort: no Cursor effort stored yet", text)
+        self.assertIn("reasoning_effort:", text)
+
+    def test_settings_shows_per_model_cursor_effort_map(self) -> None:
+        self.effort_path.write_text(
+            json.dumps(
+                {"models": {"gpt-5.6-sol": "max", "gpt-5.6-terra": "medium"}}
+            ),
+            encoding="utf-8",
+        )
+
+        self.console.handle_line("settings")
+
+        text = self.output()
+        self.assertIn("cursor_effort: gpt-5.6-sol=max, gpt-5.6-terra=medium", text)
+        self.assertIn(f"reasoning_effort: {self.server.config.reasoning_effort}", text)
 
     def test_logs_off_disables_verbose(self) -> None:
         self.console.set_verbose(True)

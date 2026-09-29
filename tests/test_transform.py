@@ -21,6 +21,7 @@ from deepseek_cursor_proxy.reasoning_store import (
     message_signature,
 )
 from deepseek_cursor_proxy.transform import (
+    PRIOR_REASONING_UNAVAILABLE,
     RECOVERY_NOTICE_CONTENT,
     RECOVERY_NOTICE_TEXT,
     extract_text_content,
@@ -30,6 +31,10 @@ from deepseek_cursor_proxy.transform import (
     rewrite_response_body,
     strip_cursor_thinking_blocks,
     strip_recovery_notice_for_upstream,
+)
+from deepseek_cursor_proxy.streaming import (
+    ConvertedCustomToolArgsAdapter,
+    StreamAccumulator,
 )
 
 
@@ -127,12 +132,89 @@ class RequestPreparationTests(unittest.TestCase):
             {"type": "function", "function": {"name": "lookup"}},
         )
 
-    def test_custom_tool_type_is_dropped_with_warning(self) -> None:
-        # Cursor sends OpenAI-only free-form tools (`type: "custom"`) when the
-        # selected model looks like a GPT model; DeepSeek rejects the whole
-        # request with `tools[i].type: unknown variant custom, expected
-        # function`, so those entries have to be filtered out.
-        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
+    def test_custom_tool_call_in_history_is_sent_as_function(self) -> None:
+        patch_text = "*** Begin Patch\n*** Add File: proxy-check.txt\n+after\n*** End Patch"
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "user", "content": "create the file"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_patch",
+                                "type": "custom",
+                                "custom": {
+                                    "name": "ApplyPatch",
+                                    "input": patch_text,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "applied",
+                    },
+                    {"role": "user", "content": "read it"},
+                ],
+                "tools": [{"type": "custom", "name": "ApplyPatch"}],
+            },
+            ProxyConfig(thinking="disabled"),
+            self.store,
+        )
+        assistant = prepared.payload["messages"][1]
+        self.assertEqual(assistant["tool_calls"][0]["type"], "function")
+        self.assertEqual(
+            json.loads(assistant["tool_calls"][0]["function"]["arguments"]),
+            {"input": patch_text},
+        )
+
+    def test_raw_function_patch_in_history_is_wrapped_for_deepseek(self) -> None:
+        patch_text = "*** Begin Patch\n*** Add File: proxy-check.txt\n+after\n*** End Patch"
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "user", "content": "create the file"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_patch",
+                                "type": "function",
+                                "function": {
+                                    "name": "ApplyPatch",
+                                    "arguments": patch_text,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "applied",
+                    },
+                ],
+                "tools": [{"type": "custom", "name": "ApplyPatch"}],
+            },
+            ProxyConfig(thinking="disabled"),
+            self.store,
+        )
+        assistant = prepared.payload["messages"][1]
+        self.assertEqual(
+            json.loads(assistant["tool_calls"][0]["function"]["arguments"]),
+            {"input": patch_text},
+        )
+
+    def test_custom_tool_type_is_converted_to_function(self) -> None:
+        # Cursor sends OpenAI-only free-form tools (`type: "custom"`) for
+        # ApplyPatch. DeepSeek only accepts function tools, so the proxy maps
+        # a valid custom name onto a single required string `input` property.
+        with self.assertNoLogs("deepseek_cursor_proxy", level="WARNING"):
             prepared = prepare_upstream_request(
                 {
                     "model": "deepseek-flash",
@@ -155,13 +237,35 @@ class RequestPreparationTests(unittest.TestCase):
                 ProxyConfig(),
                 self.store,
             )
+        tools = prepared.payload["tools"]
         self.assertEqual(
-            [tool["function"]["name"] for tool in prepared.payload["tools"]],
-            ["read_file"],
+            [tool["function"]["name"] for tool in tools],
+            ["read_file", "apply_patch"],
         )
-        self.assertIn("apply_patch", "\n".join(captured.output))
+        apply_patch = tools[1]
+        self.assertEqual(apply_patch["type"], "function")
+        self.assertEqual(
+            apply_patch["function"]["parameters"],
+            {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "Entire tool input in this tool's own format, "
+                            "not wrapped in extra JSON."
+                        ),
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        )
+        self.assertIn("Free-form patch tool", apply_patch["function"]["description"])
+        self.assertIn("input", apply_patch["function"]["description"])
+        self.assertEqual(prepared.converted_custom_tool_names, frozenset({"apply_patch"}))
 
-    def test_tools_and_tool_choice_are_removed_when_nothing_survives(self) -> None:
+    def test_tools_and_tool_choice_keep_converted_custom_tool(self) -> None:
         prepared = prepare_upstream_request(
             {
                 "model": "deepseek-flash",
@@ -172,10 +276,16 @@ class RequestPreparationTests(unittest.TestCase):
             ProxyConfig(),
             self.store,
         )
-        self.assertNotIn("tools", prepared.payload)
-        self.assertNotIn("tool_choice", prepared.payload)
+        self.assertEqual(
+            prepared.payload["tools"][0]["function"]["name"], "apply_patch"
+        )
+        self.assertEqual(
+            prepared.payload["tool_choice"],
+            {"type": "function", "function": {"name": "apply_patch"}},
+        )
+        self.assertEqual(prepared.converted_custom_tool_names, frozenset({"apply_patch"}))
 
-    def test_tool_choice_to_a_dropped_tool_is_removed(self) -> None:
+    def test_tool_choice_to_a_converted_custom_tool_is_kept(self) -> None:
         prepared = prepare_upstream_request(
             {
                 "model": "deepseek-flash",
@@ -197,9 +307,221 @@ class RequestPreparationTests(unittest.TestCase):
         )
         self.assertEqual(
             [tool["function"]["name"] for tool in prepared.payload["tools"]],
+            ["read_file", "apply_patch"],
+        )
+        self.assertEqual(
+            prepared.payload["tool_choice"],
+            {"type": "function", "function": {"name": "apply_patch"}},
+        )
+
+    def test_custom_tool_with_invalid_name_is_dropped(self) -> None:
+        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
+            prepared = prepare_upstream_request(
+                {
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {"type": "custom", "name": "bad name!"},
+                        {
+                            "type": "function",
+                            "function": {"name": "read_file", "parameters": {}},
+                        },
+                    ],
+                },
+                ProxyConfig(),
+                self.store,
+            )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in prepared.payload["tools"]],
             ["read_file"],
         )
-        self.assertNotIn("tool_choice", prepared.payload)
+        self.assertIn("bad name!", "\n".join(captured.output))
+        self.assertEqual(prepared.converted_custom_tool_names, frozenset())
+
+    def test_converted_tool_arguments_are_unwrapped_in_response(self) -> None:
+        patch_text = "*** Begin Patch\n*** Update File: a.py\n*** End Patch"
+        body = json.dumps(
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": "deepseek-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_patch",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "ApplyPatch",
+                                        "arguments": json.dumps({"input": patch_text}),
+                                    },
+                                },
+                                {
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps(
+                                            {"input": "should stay wrapped"}
+                                        ),
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ).encode()
+        rewritten = rewrite_response_body(
+            body,
+            "deepseek-flash",
+            self.store,
+            [{"role": "user", "content": "edit"}],
+            converted_custom_tool_names=frozenset({"ApplyPatch"}),
+        )
+        tool_calls = json.loads(rewritten)["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(tool_calls[0]["type"], "function")
+        self.assertEqual(tool_calls[0]["id"], "call_patch")
+        self.assertEqual(tool_calls[0]["function"]["name"], "ApplyPatch")
+        self.assertEqual(tool_calls[0]["function"]["arguments"], patch_text)
+        self.assertNotIn("custom", tool_calls[0])
+        self.assertEqual(
+            tool_calls[1]["function"]["arguments"],
+            json.dumps({"input": "should stay wrapped"}),
+        )
+
+    def test_converted_tool_arguments_are_unwrapped_when_streaming(self) -> None:
+        patch_text = "*** Begin Patch"
+        wrapped = json.dumps({"input": patch_text})
+        accumulator = StreamAccumulator()
+        adapter = ConvertedCustomToolArgsAdapter({"ApplyPatch"})
+        chunks = [
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_patch",
+                                    "type": "function",
+                                    "function": {"name": "ApplyPatch"},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": wrapped[:8]},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": wrapped[8:]},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        ]
+        outbound_calls: list[dict] = []
+        for chunk in chunks:
+            accumulator.ingest_chunk(chunk)
+            adapter.rewrite_chunk(chunk, accumulator)
+            for choice in chunk.get("choices") or []:
+                for tool_call in (choice.get("delta") or {}).get("tool_calls") or []:
+                    outbound_calls.append(tool_call)
+        self.assertEqual(len(outbound_calls), 1)
+        self.assertEqual(outbound_calls[0]["type"], "function")
+        self.assertEqual(outbound_calls[0]["id"], "call_patch")
+        self.assertEqual(outbound_calls[0]["function"]["name"], "ApplyPatch")
+        self.assertEqual(outbound_calls[0]["function"]["arguments"], patch_text)
+        self.assertNotIn("custom", outbound_calls[0])
+        self.assertEqual(
+            accumulator.choices[0].tool_calls[0]["function"]["arguments"],
+            patch_text,
+        )
+
+    def test_normal_function_tool_arguments_are_not_rewritten(self) -> None:
+        body = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":"a.py"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        rewritten = rewrite_response_body(
+            body,
+            "deepseek-flash",
+            self.store,
+            [],
+            converted_custom_tool_names=frozenset({"ApplyPatch"}),
+        )
+        self.assertEqual(
+            json.loads(rewritten)["choices"][0]["message"]["tool_calls"][0][
+                "function"
+            ]["arguments"],
+            '{"path":"a.py"}',
+        )
 
     def test_function_tool_without_name_is_dropped(self) -> None:
         prepared = prepare_upstream_request(
@@ -503,6 +825,236 @@ class RequestPreparationTests(unittest.TestCase):
             self.store,
         )
         self.assertEqual(prepared.missing_reasoning_messages, 0)
+        self.assertNotIn("reasoning_content", prepared.payload["messages"][1])
+
+    def test_tools_request_restores_reasoning_on_plain_assistant(self) -> None:
+        """DeepSeek thinking mode rejects any assistant turn once tools are set."""
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {}},
+                    }
+                ],
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "again"},
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.missing_reasoning_messages, 0)
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
+        self.assertEqual(
+            [message["role"] for message in prepared.payload["messages"]],
+            ["user", "assistant", "user"],
+        )
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+
+    def test_tools_request_keeps_history_when_only_some_reasoning_is_cached(
+        self,
+    ) -> None:
+        history_before_tool = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "read the file"},
+        ]
+        tool_call = {
+            "id": "call_read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+        namespace = _default_cache_namespace()
+        lineage = conversation_lineage(history_before_tool)
+        self.store.store_assistant_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Need the file.",
+                "tool_calls": [tool_call],
+            },
+            conversation_scope(history_before_tool, namespace, lineage),
+            namespace,
+            history_before_tool,
+            lineage=lineage,
+        )
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {}},
+                    }
+                ],
+                "messages": [
+                    *history_before_tool,
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_read",
+                        "content": "contents",
+                    },
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
+        self.assertEqual(len(prepared.payload["messages"]), 5)
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+        self.assertEqual(
+            prepared.payload["messages"][3]["reasoning_content"],
+            "Need the file.",
+        )
+
+    def test_uncached_plain_assistant_does_not_drop_uncached_tool_turn(self) -> None:
+        tool_call = {
+            "id": "call_read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "read_file", "parameters": {}},
+                    }
+                ],
+                "messages": [
+                    {"role": "user", "content": "earlier"},
+                    {"role": "assistant", "content": "noted"},
+                    {"role": "user", "content": "read the file"},
+                    {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_read",
+                        "content": "contents",
+                    },
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
+        self.assertEqual(
+            [message["role"] for message in prepared.payload["messages"]],
+            ["user", "assistant", "user", "assistant", "tool"],
+        )
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+        self.assertEqual(
+            prepared.payload["messages"][3]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+
+    def test_blank_reasoning_on_custom_tool_call_is_restored_from_cache(
+        self,
+    ) -> None:
+        prior = [{"role": "user", "content": "create the file"}]
+        patch_text = (
+            "*** Begin Patch\n*** Add File: proxy-check.txt\n+after\n*** End Patch"
+        )
+        namespace = _default_cache_namespace()
+        lineage = conversation_lineage(prior)
+        self.store.store_assistant_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Add the file with ApplyPatch.",
+                "tool_calls": [
+                    {
+                        "id": "call_patch",
+                        "type": "function",
+                        "function": {
+                            "name": "ApplyPatch",
+                            "arguments": patch_text,
+                        },
+                    }
+                ],
+            },
+            conversation_scope(prior, namespace, lineage),
+            namespace,
+            prior,
+            lineage=lineage,
+        )
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [{"type": "custom", "name": "ApplyPatch"}],
+                "messages": [
+                    *prior,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_patch",
+                                "type": "custom",
+                                "custom": {
+                                    "name": "ApplyPatch",
+                                    "input": patch_text,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_patch",
+                        "content": "applied",
+                    },
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            "Add the file with ApplyPatch.",
+        )
+        self.assertEqual(prepared.missing_reasoning_messages, 0)
+
+    def test_echoed_thinking_block_fills_reasoning_when_cache_misses(self) -> None:
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "tools": [{"type": "custom", "name": "ApplyPatch"}],
+                "messages": [
+                    {"role": "user", "content": "create the file"},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "<details>\n<summary>Thinking</summary>\n\n"
+                            "Add proxy-check.txt via ApplyPatch.\n</details>\n\n"
+                        ),
+                    },
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        assistant = prepared.payload["messages"][1]
+        self.assertEqual(
+            assistant["reasoning_content"],
+            "Add proxy-check.txt via ApplyPatch.",
+        )
+        self.assertNotIn("<details>", assistant["content"])
+        self.assertEqual(prepared.recovery_dropped_messages, 0)
 
 
 class RecoveryNoticeStrippingTests(unittest.TestCase):
@@ -901,7 +1453,7 @@ class CrossModeAndModelTests(unittest.TestCase):
             "Reasoning for thread A.",
         )
 
-    def test_recovered_response_is_recorded_under_pre_recovery_scope(self) -> None:
+    def test_cold_cache_keeps_transcript_with_placeholder_reasoning(self) -> None:
         old_tool_call = {
             "id": "call_old",
             "type": "function",
@@ -924,14 +1476,26 @@ class CrossModeAndModelTests(unittest.TestCase):
                 {"role": "user", "content": "continue with DeepSeek"},
             ],
         }
-        first_recovered = prepare_upstream_request(
+        first_prepared = prepare_upstream_request(
             first_payload,
             ProxyConfig(missing_reasoning_strategy="recover"),
             self.store,
         )
-        self.assertEqual(first_recovered.recovered_reasoning_messages, 1)
+        self.assertEqual(first_prepared.recovered_reasoning_messages, 0)
+        self.assertEqual(first_prepared.recovery_dropped_messages, 0)
+        self.assertIsNone(first_prepared.recovery_notice)
+        self.assertEqual(first_prepared.missing_reasoning_messages, 0)
+        self.assertEqual(
+            [message["role"] for message in first_prepared.payload["messages"]],
+            ["user", "assistant", "tool", "user"],
+        )
+        self.assertEqual(
+            first_prepared.payload["messages"][1]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
 
-        # Simulate DeepSeek's response to the recovered request.
+        # Simulate DeepSeek's response; reasoning is recorded under the kept
+        # transcript scope so the next turn can restore it from cache.
         response_body = json.dumps(
             {
                 "id": "chatcmpl-test",
@@ -955,31 +1519,23 @@ class CrossModeAndModelTests(unittest.TestCase):
             response_body,
             "deepseek-v4-pro",
             self.store,
-            first_recovered.payload["messages"],
-            first_recovered.cache_namespace,
-            content_prefix=first_recovered.recovery_notice,
-            recording_contexts=first_recovered.record_response_contexts,
-            lineage=first_recovered.lineage,
-            agent_id=first_recovered.agent_id,
+            first_prepared.payload["messages"],
+            first_prepared.cache_namespace,
+            content_prefix=first_prepared.recovery_notice,
+            recording_contexts=first_prepared.record_response_contexts,
+            lineage=first_prepared.lineage,
+            agent_id=first_prepared.agent_id,
         )
         recovered_assistant = json.loads(rewritten)["choices"][0]["message"]
-
-        # Reasoning must be recorded under BOTH scopes — pre-recovery (so
-        # subsequent Cursor requests echoing the with-prefix history hit) and
-        # post-recovery (so an immediate continuation also hits).
-        self.assertEqual(len(first_recovered.record_response_contexts), 2)
-        for scope, _messages in first_recovered.record_response_contexts:
-            self.assertEqual(
-                self.store.get(
-                    f"scope:{scope}:signature:{message_signature(recovered_assistant)}"
-                ),
-                "Need the new lookup.",
-            )
+        self.assertEqual(
+            self.store.get(
+                f"scope:{first_prepared.record_response_scope}:signature:"
+                f"{message_signature(recovered_assistant)}"
+            ),
+            "Need the new lookup.",
+        )
         recovered_assistant.pop("reasoning_content", None)
 
-        # Cursor's next request echoes the recovered assistant + tool result.
-        # The proxy should detect the recovery boundary, retire the prefix,
-        # and continue cleanly without recovering again.
         second_payload = {
             "model": "deepseek-v4-pro",
             "messages": [
@@ -998,10 +1554,13 @@ class CrossModeAndModelTests(unittest.TestCase):
         self.assertEqual(second_prepared.missing_reasoning_messages, 0)
         self.assertEqual(second_prepared.recovered_reasoning_messages, 0)
         self.assertEqual(second_prepared.recovery_dropped_messages, 0)
-        self.assertTrue(second_prepared.continued_recovery_boundary)
-        self.assertGreater(second_prepared.retired_prefix_messages, 0)
+        self.assertIsNone(second_prepared.recovery_notice)
         self.assertEqual(
-            second_prepared.payload["messages"][2]["reasoning_content"],
+            second_prepared.payload["messages"][1]["reasoning_content"],
+            PRIOR_REASONING_UNAVAILABLE,
+        )
+        self.assertEqual(
+            second_prepared.payload["messages"][4]["reasoning_content"],
             "Need the new lookup.",
         )
 
